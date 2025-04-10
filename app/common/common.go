@@ -40,8 +40,9 @@ func RunREPL(ipStack *ip.IPStack) {
 				fmt.Println("Invalid interface name provided. ", err)
 			}
 		case "send":
-			// TODO: send command
-			fmt.Println("Send command")
+			destIp := words[1]
+			message := strings.Join(words[2:], " ")
+			protocol.SendTest(ipStack, destIp, message)
 		default:
 			fmt.Println("Invalid command:")
 			ListCommands()
