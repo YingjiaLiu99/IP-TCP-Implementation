@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"text/tabwriter"
 
+	ipv4header "github.com/brown-csci1680/iptcp-headers"
 	"github.com/google/netstack/tcpip/header"
 )
 
