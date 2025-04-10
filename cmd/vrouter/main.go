@@ -1,6 +1,7 @@
 package main
 
 import (
+	"IP-TCP-Implementation/app/common"
 	"IP-TCP-Implementation/app/ip"
 	"IP-TCP-Implementation/app/lnxconfig"
 	"log/slog"
@@ -13,7 +14,7 @@ func main() {
 	}
 
 	// Change logging level
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
 	lnxFile := os.Args[2]
@@ -26,5 +27,10 @@ func main() {
 
 	ipStack := ip.Initialize(configInfo)
 	slog.Debug("IP stack initialized to: ", ipStack)
+
+	// Set up all interfaces to listen and respond
+
+	// REPL
+	common.RunREPL(ipStack)
 
 }

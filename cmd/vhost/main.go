@@ -14,7 +14,7 @@ func main() {
 	}
 
 	// Change logging level
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
 	lnxFile := os.Args[2]
@@ -29,6 +29,9 @@ func main() {
 	slog.Debug("IP stack initialized to: ", ipStack)
 
 	// Set up all interfaces to listen and respond
+	// for _, iface := range ipStack.Interfaces {
+	// 	go iface.ListenLinkLayer()
+	// }
 
 	// REPL
 	common.RunREPL(ipStack)
