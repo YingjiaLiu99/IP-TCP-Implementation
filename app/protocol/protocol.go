@@ -19,3 +19,7 @@ func SendTest(ipStack *ip.IPStack, destIpStr string, msg string) {
 	}
 	fmt.Printf("Sent %d bytes\n", n)
 }
+
+func TestPacketHandler(args *ip.HandlerArgs) {
+	fmt.Printf("Received test packet: Src: %s, Dst: %s, TTL: %d, Data: %s\n", args.Src, args.Dst, args.TTL, string(args.Message))
+}

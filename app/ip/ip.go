@@ -16,11 +16,9 @@ import (
 	"github.com/google/netstack/tcpip/header"
 )
 
-// IP header
+// General
 const (
-	Version   int = 4
-	HeaderLen int = 20 // Header length is always 20 when no IP options
-	TTL       int = 32
+	MaxMessageSize = 1400
 )
 
 // Routing mode
@@ -41,13 +39,30 @@ const (
 	RouteTypeRIP    RouteType = 2
 )
 
+// IP header
+const (
+	Version   int = 4
+	HeaderLen int = 20 // Header length is always 20 when no IP options
+	TTL       int = 32
+)
+
+// Recv Handler function
+type HandlerArgs struct {
+	Src     netip.Addr
+	Dst     netip.Addr
+	TTL     int
+	Message []byte
+}
+
+type HandlerFunc = func(*HandlerArgs)
+
 type IPStack struct {
 	Interfaces          []Interface
 	Neighbors           []Neighbor
 	RoutingMode         RoutingMode
 	RipNeighbors        []netip.Addr
 	RoutingTable        []Route
-	RecvHandlerRegistry map[int]func()
+	RecvHandlerRegistry map[int]HandlerFunc
 }
 
 type Interface struct {
@@ -106,9 +121,10 @@ func Initialize(configInfo *lnxconfig.IPConfig) *IPStack {
 	ipStack.RoutingMode = RoutingMode(configInfo.RoutingMode)
 
 	// Initialize RIP neighbors
-	for _, ripNbor := range configInfo.RipNeighbors {
-		ipStack.RipNeighbors = append(ipStack.RipNeighbors, ripNbor)
-	}
+	// for _, ripNbor := range configInfo.RipNeighbors {
+	// 	ipStack.RipNeighbors = append(ipStack.RipNeighbors, ripNbor)
+	// }
+	ipStack.RipNeighbors = append(ipStack.RipNeighbors, configInfo.RipNeighbors...)
 
 	// Initialize Routing table
 
@@ -137,6 +153,9 @@ func Initialize(configInfo *lnxconfig.IPConfig) *IPStack {
 			Cost: 0,
 		})
 	}
+
+	// Initialize registry map
+	ipStack.RecvHandlerRegistry = make(map[int]func(*HandlerArgs))
 
 	return ipStack
 }
@@ -220,7 +239,7 @@ func (ipStack *IPStack) SendIP(dst netip.Addr, protocolNum uint8, data []byte) (
 		return 0, err
 	}
 
-	// Compute the checksum (see below)
+	// Compute the checksum
 	// Cast back to an int, which is what the Header structure expects
 	hdr.Checksum = int(ipStack.computeChecksum(headerBytes))
 
@@ -237,6 +256,108 @@ func (ipStack *IPStack) SendIP(dst netip.Addr, protocolNum uint8, data []byte) (
 	n, err := iface.SendLinkLayer(nborToSend.UDPAddr, bytesToSend)
 	slog.Info("Sent %d bytes", n)
 	return n, err
+}
+
+// Forward IP messages based on destination
+func (ipStack *IPStack) ForwardIP(hdr *ipv4header.IPv4Header, data []byte) {
+	if hdr.TTL <= 0 {
+		slog.Warn("Dropping packet, TTL expired")
+		return
+	}
+	route, nborToSend, err := ipStack.getRouteForDest(hdr.Dst)
+	if err != nil {
+		slog.Warn("Failed to forward packet, no route found")
+		return
+	}
+	iface, err := ipStack.getInterfaceByName(route.NextHop.InterfaceName)
+	if err != nil {
+		slog.Warn("Failed to forward packet, no interface for selected route found")
+		return
+	}
+
+	hdr.Checksum = 0
+
+	// Assemble the header into a byte array
+	headerBytes, err := hdr.Marshal()
+	if err != nil {
+		slog.Warn("Failed to forward packet, Error marshalling header:  ", err)
+		return
+	}
+
+	// Compute the checksum
+	// Cast back to an int, which is what the Header structure expects
+	hdr.Checksum = int(ipStack.computeChecksum(headerBytes))
+
+	headerBytes, err = hdr.Marshal()
+	if err != nil {
+		slog.Warn("Failed to forward packet, Error marshalling header:  ", err)
+		return
+	}
+
+	bytesToSend := make([]byte, 0, len(headerBytes)+len(data))
+	bytesToSend = append(bytesToSend, headerBytes...)
+	bytesToSend = append(bytesToSend, data...)
+
+	n, err := iface.SendLinkLayer(nborToSend.UDPAddr, bytesToSend)
+	if err != nil {
+		slog.Warn("Failed to forward packet, Error sending over link layer:  ", err)
+		return
+	}
+	slog.Info("Sent %d bytes", n)
+}
+
+// Recv IP messages, the content is passed by interface (Link Layer) process it as IP packet
+func (ipStack *IPStack) RecvIP(recdOnIp netip.Addr, data []byte) {
+	// Marshal the received byte array into a UDP header
+	hdr, err := ipv4header.ParseHeader(data)
+	if err != nil {
+		slog.Warn("Dropping packet, error parsing header", err)
+		return
+	}
+	headerSize := hdr.Len
+	headerBytes := data[:headerSize]
+
+	// Validate the checksum
+	checksumFromHeader := uint16(hdr.Checksum)
+	computedChecksum := ipStack.validateChecksum(headerBytes, checksumFromHeader)
+	if computedChecksum != checksumFromHeader {
+		slog.Warn("Dropping packet, incorrect checksum")
+		return
+	}
+
+	// Handle TTL: decrement ttl if it is 0 and not yet on its dst then drop
+	hdr.TTL = hdr.TTL - 1
+	if hdr.TTL <= 0 && hdr.Dst != recdOnIp {
+		slog.Warn("Dropping packet, TTL expired")
+		return
+	}
+
+	// Get protocol number
+	protocolNum := hdr.Protocol
+	// Get the message, which starts after the header
+	message := data[headerSize:]
+
+	// Check the destination of the packet
+	if hdr.Dst == recdOnIp { // Packet reached its dst, call handler
+		handlerFunc, ok := ipStack.RecvHandlerRegistry[protocolNum]
+		if !ok {
+			slog.Warn("Dropping packet, unsuported protocol num: ", protocolNum)
+			return
+		}
+		handlerFunc(&HandlerArgs{
+			Src:     hdr.Src,
+			Dst:     hdr.Dst,
+			TTL:     hdr.TTL,
+			Message: message,
+		})
+	} else { // Forward the packet appropriately
+		ipStack.ForwardIP(hdr, message)
+	}
+}
+
+// Register a recv handler which will be called based on the protocol of the msg recd
+func (ipStack *IPStack) RegisterRecvHandler(protocolNum uint8, callbackFunc HandlerFunc) {
+	ipStack.RecvHandlerRegistry[int(protocolNum)] = callbackFunc
 }
 
 // ---------- IPStack Helper Methods ----------
@@ -303,6 +424,12 @@ func (ipStack *IPStack) computeChecksum(b []byte) uint16 {
 	return checksumInv
 }
 
+// Validate the checksum using the netstack package
+func (ipStack *IPStack) validateChecksum(b []byte, fromHeader uint16) uint16 {
+	checksum := header.Checksum(b, fromHeader)
+	return checksum
+}
+
 // ---------- Interface Methods ----------
 
 // Return string description of boolean interface state
@@ -358,7 +485,7 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 }
 
 // Listen on the interface for packets
-func (iface *Interface) ListenLinkLayer() {
+func (iface *Interface) ListenLinkLayer(ipStack *IPStack) {
 	// Get the address structure for the address on which we want to listen
 	listenString := iface.UDPAddr.String()
 	listenAddr, err := net.ResolveUDPAddr("udp4", listenString)
@@ -376,11 +503,13 @@ func (iface *Interface) ListenLinkLayer() {
 
 	for {
 		buffer := make([]byte, MaxMessageSize)
-
 		// Read on the UDP port
-		_, sourceAddr, err := conn.ReadFromUDP(buffer)
+		_, _, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			log.Panicln("Error reading from UDP socket ", err)
+		}
+		if iface.IsUp {
+			ipStack.RecvIP(iface.AssignedIP, buffer)
 		}
 	}
 }

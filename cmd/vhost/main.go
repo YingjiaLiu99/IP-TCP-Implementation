@@ -28,10 +28,13 @@ func main() {
 	ipStack := ip.Initialize(configInfo)
 	slog.Debug("IP stack initialized to: ", ipStack)
 
+	// Register handlers for supported packets/protocols
+	ipStack.RegisterRecvHandler(0, protocol.TestPacketHandler)
+
 	// Set up all interfaces to listen and respond
-	// for _, iface := range ipStack.Interfaces {
-	// 	go iface.ListenLinkLayer()
-	// }
+	for _, iface := range ipStack.Interfaces {
+		go iface.ListenLinkLayer(ipStack)
+	}
 
 	// REPL
 	common.RunREPL(ipStack)
