@@ -4,6 +4,7 @@ import (
 	"IP-TCP-Implementation/app/common"
 	"IP-TCP-Implementation/app/ip"
 	"IP-TCP-Implementation/app/lnxconfig"
+	"IP-TCP-Implementation/app/protocol"
 	"log/slog"
 	"os"
 )
@@ -32,8 +33,9 @@ func main() {
 	ipStack.RegisterRecvHandler(0, protocol.TestPacketHandler)
 
 	// Set up all interfaces to listen and respond
-	for _, iface := range ipStack.Interfaces {
-		go iface.ListenLinkLayer(ipStack)
+	for idx, iface := range ipStack.Interfaces {
+		slog.Debug("Start serving %s", iface.UDPAddr)
+		go ipStack.Interfaces[idx].ListenLinkLayer(ipStack)
 	}
 
 	// REPL

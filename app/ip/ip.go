@@ -497,7 +497,7 @@ func (iface *Interface) ListenLinkLayer(ipStack *IPStack) {
 	// Create a socket and bind it to the port on which we want to receive data
 	conn, err := net.ListenUDP("udp4", listenAddr)
 	if err != nil {
-		slog.Warn("Could not bind to UDP port: ", err)
+		slog.Warn("Could not bind to UDP port for %s: ", listenString, err)
 		return
 	}
 
