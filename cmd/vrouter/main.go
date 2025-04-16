@@ -35,7 +35,7 @@ func main() {
 	// Set up all interfaces to listen and respond
 	for idx, iface := range ipStack.Interfaces {
 		slog.Debug("Start serving %s", iface.UDPAddr)
-		go ipStack.Interfaces[idx].ListenLinkLayer(ipStack)
+		go ipStack.Interfaces[idx].InitAndListenLinkLayer(ipStack)
 	}
 
 	// REPL

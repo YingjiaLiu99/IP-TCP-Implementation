@@ -71,6 +71,7 @@ type Interface struct {
 	AssignedPrefix netip.Prefix
 	UDPAddr        netip.AddrPort
 	IsUp           bool
+	Conn           *net.UDPConn
 }
 
 type Neighbor struct {
@@ -447,13 +448,13 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 		return 0, nil
 	}
 
-	// Turn the address string into a UDPAddr for the connection
-	bindAddrString := iface.UDPAddr.String()
-	bindLocalAddr, err := net.ResolveUDPAddr("udp4", bindAddrString)
-	if err != nil {
-		slog.Warn("Error resolving address:  ", err)
-		return 0, err
-	}
+	// // Turn the address string into a UDPAddr for the connection
+	// bindAddrString := iface.UDPAddr.String()
+	// bindLocalAddr, err := net.ResolveUDPAddr("udp4", bindAddrString)
+	// if err != nil {
+	// 	slog.Warn("Error resolving address:  ", err)
+	// 	return 0, err
+	// }
 
 	// Turn the address string into a UDPAddr for the connection
 	addrString := dstUDPAddr.String()
@@ -468,14 +469,14 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 
 	// Bind on the local UDP port:  this sets the source port
 	// and creates a conn
-	conn, err := net.ListenUDP("udp4", bindLocalAddr)
-	if err != nil {
-		slog.Warn("Dial: ", err)
-		return 0, err
-	}
+	// conn, err := net.ListenUDP("udp4", bindLocalAddr)
+	// if err != nil {
+	// 	slog.Warn("Dial: ", err)
+	// 	return 0, err
+	// }
 
 	// Send the message to the "link-layer" addr:port on UDP
-	bytesWritten, err := conn.WriteToUDP(bytesToSend, remoteAddr)
+	bytesWritten, err := iface.Conn.WriteToUDP(bytesToSend, remoteAddr)
 	if err != nil {
 		slog.Warn("Error writing to socket: ", err)
 		return 0, err
@@ -485,7 +486,7 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 }
 
 // Listen on the interface for packets
-func (iface *Interface) ListenLinkLayer(ipStack *IPStack) {
+func (iface *Interface) InitAndListenLinkLayer(ipStack *IPStack) {
 	// Get the address structure for the address on which we want to listen
 	listenString := iface.UDPAddr.String()
 	listenAddr, err := net.ResolveUDPAddr("udp4", listenString)
@@ -501,10 +502,13 @@ func (iface *Interface) ListenLinkLayer(ipStack *IPStack) {
 		return
 	}
 
+	// Initialize connection and use it to listen and send UDP packets
+	iface.Conn = conn
+
 	for {
 		buffer := make([]byte, MaxMessageSize)
 		// Read on the UDP port
-		_, _, err := conn.ReadFromUDP(buffer)
+		_, _, err := iface.Conn.ReadFromUDP(buffer)
 		if err != nil {
 			log.Panicln("Error reading from UDP socket ", err)
 		}
