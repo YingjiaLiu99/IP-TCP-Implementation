@@ -208,7 +208,7 @@ func (ipStack *IPStack) SetInterfaceState(interfaceName string, isUp bool) error
 
 // Sending IP messages to the provided destination
 func (ipStack *IPStack) SendIP(dst netip.Addr, protocolNum uint8, data []byte) (int, error) {
-	route, nborToSend, err := ipStack.getRouteForDest(dst)
+	route, nextHopUDPAddr, err := ipStack.getRouteForDest(dst)
 	if err != nil {
 		return 0, err
 	}
@@ -254,7 +254,7 @@ func (ipStack *IPStack) SendIP(dst netip.Addr, protocolNum uint8, data []byte) (
 	bytesToSend = append(bytesToSend, headerBytes...)
 	bytesToSend = append(bytesToSend, data...)
 
-	n, err := iface.SendLinkLayer(nborToSend.UDPAddr, bytesToSend)
+	n, err := iface.SendLinkLayer(nextHopUDPAddr, bytesToSend)
 	slog.Info("Sent %d bytes", n)
 	return n, err
 }
@@ -265,7 +265,7 @@ func (ipStack *IPStack) ForwardIP(hdr *ipv4header.IPv4Header, data []byte) {
 		slog.Warn("Dropping packet, TTL expired")
 		return
 	}
-	route, nborToSend, err := ipStack.getRouteForDest(hdr.Dst)
+	route, nextHopUDPAddr, err := ipStack.getRouteForDest(hdr.Dst)
 	if err != nil {
 		slog.Warn("Failed to forward packet, no route found")
 		return
@@ -299,7 +299,7 @@ func (ipStack *IPStack) ForwardIP(hdr *ipv4header.IPv4Header, data []byte) {
 	bytesToSend = append(bytesToSend, headerBytes...)
 	bytesToSend = append(bytesToSend, data...)
 
-	n, err := iface.SendLinkLayer(nborToSend.UDPAddr, bytesToSend)
+	n, err := iface.SendLinkLayer(nextHopUDPAddr, bytesToSend)
 	if err != nil {
 		slog.Warn("Failed to forward packet, Error sending over link layer:  ", err)
 		return
@@ -308,7 +308,7 @@ func (ipStack *IPStack) ForwardIP(hdr *ipv4header.IPv4Header, data []byte) {
 }
 
 // Recv IP messages, the content is passed by interface (Link Layer) process it as IP packet
-func (ipStack *IPStack) RecvIP(recdOnIp netip.Addr, data []byte) {
+func (ipStack *IPStack) RecvIP(data []byte) {
 	// Marshal the received byte array into a UDP header
 	hdr, err := ipv4header.ParseHeader(data)
 	if err != nil {
@@ -326,9 +326,19 @@ func (ipStack *IPStack) RecvIP(recdOnIp netip.Addr, data []byte) {
 		return
 	}
 
+	// Check the destination of the packet is one of this node's iface
+	reachedDst := false
+	for _, iface := range ipStack.Interfaces {
+		if hdr.Dst == iface.AssignedIP {
+			reachedDst = true
+			break
+		}
+	}
+
 	// Handle TTL: decrement ttl if it is 0 and not yet on its dst then drop
 	hdr.TTL = hdr.TTL - 1
-	if hdr.TTL <= 0 && hdr.Dst != recdOnIp {
+	// CHECK: this can be removed as packet drops in forwarding if ttl expired
+	if hdr.TTL <= 0 && !reachedDst {
 		slog.Warn("Dropping packet, TTL expired")
 		return
 	}
@@ -338,8 +348,7 @@ func (ipStack *IPStack) RecvIP(recdOnIp netip.Addr, data []byte) {
 	// Get the message, which starts after the header
 	message := data[headerSize:]
 
-	// Check the destination of the packet
-	if hdr.Dst == recdOnIp { // Packet reached its dst, call handler
+	if reachedDst { // Packet reached its dst, call handler
 		handlerFunc, ok := ipStack.RecvHandlerRegistry[protocolNum]
 		if !ok {
 			slog.Warn("Dropping packet, unsuported protocol num: ", protocolNum)
@@ -384,7 +393,7 @@ func (ipStack *IPStack) getInterfaceStateByName(interfaceName string) bool {
 }
 
 // Given a dest IP return the route it would take from the routing table
-func (ipStack *IPStack) getRouteForDest(dst netip.Addr) (Route, Neighbor, error) {
+func (ipStack *IPStack) getRouteForDest(dst netip.Addr) (Route, netip.AddrPort, error) {
 	slog.Debug("dst: ", dst)
 	destRoute := Route{}
 	for _, route := range ipStack.RoutingTable {
@@ -395,23 +404,35 @@ func (ipStack *IPStack) getRouteForDest(dst netip.Addr) (Route, Neighbor, error)
 
 	slog.Debug("Dest route: ", destRoute)
 
-	nborToSend := Neighbor{}
+	var nextHopUDPAddr netip.AddrPort
 	var err error = nil
 	if (destRoute == Route{}) {
 		slog.Warn("Failed to find a match in the routing table for %s", dst)
 		err = errors.New("no matching route found")
 	} else if destRoute.RouteType == RouteTypeLocal {
-		for _, nbor := range ipStack.Neighbors {
-			if nbor.DestAddr == dst {
-				nborToSend = nbor
+		// Check self
+		reachedDst := false
+		for _, iface := range ipStack.Interfaces {
+			if iface.AssignedIP == dst {
+				nextHopUDPAddr = iface.UDPAddr
+				reachedDst = true
 				break
 			}
 		}
-		slog.Debug("Nbor to send: ", nborToSend)
+		// Check nbors
+		if !reachedDst {
+			for _, nbor := range ipStack.Neighbors {
+				if nbor.DestAddr == dst {
+					nextHopUDPAddr = nbor.UDPAddr
+					break
+				}
+			}
+		}
+		slog.Debug("Next hop UDP addr to send: ", nextHopUDPAddr)
 	} else {
-		destRoute, nborToSend, err = ipStack.getRouteForDest(destRoute.NextHop.Addr)
+		destRoute, nextHopUDPAddr, err = ipStack.getRouteForDest(destRoute.NextHop.Addr)
 	}
-	return destRoute, nborToSend, err
+	return destRoute, nextHopUDPAddr, err
 }
 
 // Compute the checksum using the netstack package
@@ -513,7 +534,7 @@ func (iface *Interface) InitAndListenLinkLayer(ipStack *IPStack) {
 			log.Panicln("Error reading from UDP socket ", err)
 		}
 		if iface.IsUp {
-			ipStack.RecvIP(iface.AssignedIP, buffer)
+			ipStack.RecvIP(buffer)
 		}
 	}
 }
