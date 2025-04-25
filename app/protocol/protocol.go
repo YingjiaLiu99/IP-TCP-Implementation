@@ -7,6 +7,7 @@ import (
 	"net/netip"
 )
 
+// The main test command provided in REPL, sends msg from one node to another
 func SendTest(ipStack *ip.IPStack, destIpStr string, msg string) {
 	destIp, err := netip.ParseAddr(destIpStr)
 	if err != nil {
@@ -20,28 +21,16 @@ func SendTest(ipStack *ip.IPStack, destIpStr string, msg string) {
 	fmt.Printf("Sent %d bytes\n", n)
 }
 
-type TestPacketArgs struct {
-	Src     netip.Addr
-	Dst     netip.Addr
-	TTL     int
-	Message string
-}
+// Handler for test command, called when test command received. Prints the msg with some header details
+func TestPacketHandler(ipStack *ip.IPStack, data []byte) {
+	// Marshal the received byte array into a UDP header
+	hdr, err := ipv4header.ParseHeader(data)
+	if err != nil {
+		slog.Warn("Dropping packet, error parsing header", err)
+		return
+	}
+	headerSize := hdr.Len
+	message := data[headerSize:]
 
-// func (args *TestPacketArgs) Marshal() ([]byte, error) {
-// 	buf := new(bytes.Buffer)
-// 	err := binary.Write(buf, binary.BigEndian, args)
-// 	if err != nil {
-// 		return []byte{}, err
-// 	}
-
-// 	err = binary.Write(buf, binary.BigEndian, msg.numStations)
-// 	if err != nil {
-// 		return []byte{}, err
-// 	}
-
-// 	return buf.Bytes(), nil
-// }
-
-func TestPacketHandler(args *ip.HandlerArgs) {
-	fmt.Printf("Received test packet: Src: %s, Dst: %s, TTL: %d, Data: %s\n", args.Src, args.Dst, args.TTL, string(args.Message))
+	fmt.Printf("Received test packet: Src: %s, Dst: %s, TTL: %d, Data: %s\n", hdr.Src, hdr.Dst, hdr.TTL-1, string(message))
 }

@@ -47,14 +47,7 @@ const (
 )
 
 // Recv Handler function
-type HandlerArgs struct {
-	Src     netip.Addr
-	Dst     netip.Addr
-	TTL     int
-	Message []byte
-}
-
-type HandlerFunc = func(*HandlerArgs)
+type HandlerFunc = func(*IPStack, []byte)
 
 type IPStack struct {
 	Interfaces          []Interface
@@ -122,9 +115,6 @@ func Initialize(configInfo *lnxconfig.IPConfig) *IPStack {
 	ipStack.RoutingMode = RoutingMode(configInfo.RoutingMode)
 
 	// Initialize RIP neighbors
-	// for _, ripNbor := range configInfo.RipNeighbors {
-	// 	ipStack.RipNeighbors = append(ipStack.RipNeighbors, ripNbor)
-	// }
 	ipStack.RipNeighbors = append(ipStack.RipNeighbors, configInfo.RipNeighbors...)
 
 	// Initialize Routing table
@@ -156,7 +146,7 @@ func Initialize(configInfo *lnxconfig.IPConfig) *IPStack {
 	}
 
 	// Initialize registry map
-	ipStack.RecvHandlerRegistry = make(map[int]func(*HandlerArgs))
+	ipStack.RecvHandlerRegistry = make(map[int]HandlerFunc)
 
 	return ipStack
 }
@@ -354,12 +344,7 @@ func (ipStack *IPStack) RecvIP(data []byte) {
 			slog.Warn("Dropping packet, unsuported protocol num: ", protocolNum)
 			return
 		}
-		handlerFunc(&HandlerArgs{
-			Src:     hdr.Src,
-			Dst:     hdr.Dst,
-			TTL:     hdr.TTL,
-			Message: message,
-		})
+		handlerFunc(ipStack, data)
 	} else { // Forward the packet appropriately
 		ipStack.ForwardIP(hdr, message)
 	}
@@ -469,14 +454,6 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 		return 0, nil
 	}
 
-	// // Turn the address string into a UDPAddr for the connection
-	// bindAddrString := iface.UDPAddr.String()
-	// bindLocalAddr, err := net.ResolveUDPAddr("udp4", bindAddrString)
-	// if err != nil {
-	// 	slog.Warn("Error resolving address:  ", err)
-	// 	return 0, err
-	// }
-
 	// Turn the address string into a UDPAddr for the connection
 	addrString := dstUDPAddr.String()
 	remoteAddr, err := net.ResolveUDPAddr("udp4", addrString)
@@ -487,14 +464,6 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 
 	slog.Debug("Sending to %s:%d\n",
 		remoteAddr.IP.String(), remoteAddr.Port)
-
-	// Bind on the local UDP port:  this sets the source port
-	// and creates a conn
-	// conn, err := net.ListenUDP("udp4", bindLocalAddr)
-	// if err != nil {
-	// 	slog.Warn("Dial: ", err)
-	// 	return 0, err
-	// }
 
 	// Send the message to the "link-layer" addr:port on UDP
 	bytesWritten, err := iface.Conn.WriteToUDP(bytesToSend, remoteAddr)
