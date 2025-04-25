@@ -85,6 +85,22 @@ type NextHop struct {
 	Addr          netip.Addr
 }
 
+// --this is for the RIP message --//
+
+// type RIPEntry struct {
+// 	Cost    uint32
+// 	Address uint32
+// 	Mask   uint32
+// }
+
+type RIPMessage struct {
+	Command    uint16
+	NumEntries uint16
+	Entries    []byte
+}
+
+// --------------------------------- //
+
 // Initializes the IPStack using the IPConfig provided.
 // Populates the routing table.
 // Returns pointer to an IPStack struct
@@ -344,7 +360,9 @@ func (ipStack *IPStack) RecvIP(data []byte) {
 			slog.Warn("Dropping packet, unsuported protocol num: ", protocolNum)
 			return
 		}
+
 		handlerFunc(ipStack, data)
+
 	} else { // Forward the packet appropriately
 		ipStack.ForwardIP(hdr, message)
 	}
@@ -504,6 +522,7 @@ func (iface *Interface) InitAndListenLinkLayer(ipStack *IPStack) {
 		}
 		if iface.IsUp {
 			ipStack.RecvIP(buffer)
+
 		}
 	}
 }
@@ -539,4 +558,9 @@ func (route *Route) getCostEntry() string {
 		return "-"
 	}
 	return strconv.Itoa(route.Cost)
+}
+
+// function that listen the RIP update message and update the route table
+func listenAndUpdate(ipStack *IPStack) {
+
 }

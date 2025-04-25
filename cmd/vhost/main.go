@@ -33,6 +33,8 @@ func main() {
 
 	// Register handlers for supported packets/protocols
 	ipStack.RegisterRecvHandler(0, protocol.TestPacketHandler)
+	// Register RIP
+	ipStack.RegisterRecvHandler(200, protocol.RIPPacketHandler)
 
 	// Set up all interfaces to listen and respond
 	for idx, iface := range ipStack.Interfaces {
