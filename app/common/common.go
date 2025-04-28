@@ -3,9 +3,12 @@ package common
 import (
 	"IP-TCP-Implementation/app/ip"
 	"IP-TCP-Implementation/app/protocol"
+	"IP-TCP-Implementation/app/tcp"
 	"bufio"
 	"fmt"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 )
@@ -55,7 +58,7 @@ func RunREPL(ipStack *ip.IPStack) {
 }
 
 // REPL that runs continuously and gives interface for users to run commands (extended with tcp)
-func RunREPLExtended(ipStack *ip.IPStack) {
+func RunREPLExtended(ipStack *ip.IPStack, tcpStack *tcp.TCPStack) {
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Print("> ")
 	for scanner.Scan() {
@@ -90,14 +93,49 @@ func RunREPLExtended(ipStack *ip.IPStack) {
 			message := strings.Join(words[2:], " ")
 			protocol.SendTest(ipStack, destIp, message)
 		case "ls":
-			// ls
+			tcpStack.PrintSocketTable()
 		case "a":
-			// port := words[1]
-			// a
+			if len(words) < 2 {
+				fmt.Println("format should be: a <port>")
+				fmt.Print("> ")
+				continue
+			}
+			port, err := strconv.Atoi(words[1])
+			if err != nil {
+				fmt.Println("<port> has to be an integer")
+				fmt.Print("> ")
+				continue
+			}
+			listener, err := tcpStack.VListen(uint16(port))
+			if err != nil {
+				fmt.Println("VAccept error:", err)
+			} else {
+				go listener.PassiveOpen()
+			}
 		case "c":
 			// vip := words[1]
 			// port := words[2]
-			// c
+			if len(words) < 3 {
+				fmt.Println("Usage: c <ip> <port>")
+				fmt.Print("> ")
+				continue
+			}
+			vip, err := netip.ParseAddr(words[1])
+			if err != nil {
+				fmt.Println("<vip> must be an IPv4 address (eg. 1.2.3.4)")
+				fmt.Print("> ")
+				continue
+			}
+			port, err := strconv.Atoi(words[2])
+			if err != nil {
+				fmt.Println("<port> must be a 16-bit unsigned integer")
+				fmt.Print("> ")
+				continue
+			}
+			_, err = tcpStack.VConnect(vip, uint16(port))
+			if err != nil {
+				fmt.Println("Failed to connect")
+			}
 		default:
 			fmt.Println("Invalid command:")
 			ListCommands(true)

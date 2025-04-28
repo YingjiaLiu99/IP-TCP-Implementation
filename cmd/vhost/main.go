@@ -47,7 +47,6 @@ func main() {
 
 	// Register handlers for supported packets/protocols
 	ipStack.RegisterRecvHandler(0, protocol.TestPacketHandler)
-	ipStack.RegisterRecvHandler(6, tcp.TCPPacketHandler)
 	// Setup and Register RIP
 	if ipStack.RoutingMode == ip.RoutingTypeRIP {
 		rip.InitRIP(ipStack)
@@ -58,6 +57,6 @@ func main() {
 	}
 
 	// REPL
-	common.RunREPLExtended(ipStack)
+	common.RunREPLExtended(ipStack, tcpStack)
 
 }
