@@ -5,6 +5,7 @@ import (
 	"IP-TCP-Implementation/app/ip"
 	"IP-TCP-Implementation/app/lnxconfig"
 	"IP-TCP-Implementation/app/protocol"
+	"IP-TCP-Implementation/app/rip"
 	"log/slog"
 	"os"
 )
@@ -31,15 +32,24 @@ func main() {
 	ipStack := ip.Initialize(configInfo)
 	slog.Debug("IP stack initialized to: ", ipStack)
 
-	// Register handlers for supported packets/protocols
-	ipStack.RegisterRecvHandler(0, protocol.TestPacketHandler)
-	// Register RIP
-	ipStack.RegisterRecvHandler(200, protocol.RIPPacketHandler)
-
 	// Set up all interfaces to listen and respond
 	for idx, iface := range ipStack.Interfaces {
 		slog.Debug("Start serving %s", iface.UDPAddr)
-		go ipStack.Interfaces[idx].InitAndListenLinkLayer(ipStack)
+		err = ipStack.Interfaces[idx].InitAndListenLinkLayer(ipStack)
+		if err != nil {
+			slog.Error("Failed to init the interface. Err: ", err)
+		}
+	}
+
+	// Register handlers for supported packets/protocols
+	ipStack.RegisterRecvHandler(0, protocol.TestPacketHandler)
+	// Setup and Register RIP
+	if ipStack.RoutingMode == ip.RoutingTypeRIP {
+		rip.InitRIP(ipStack)
+		// Begin Periodic RoutingTable cleanup
+		go ipStack.BeginRoutingTableCleanup()
+		// Register Handler
+		ipStack.RegisterRecvHandler(200, rip.RIPPacketHandler)
 	}
 
 	// REPL

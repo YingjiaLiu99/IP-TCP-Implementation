@@ -10,7 +10,9 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"sync"
 	"text/tabwriter"
+	"time"
 
 	ipv4header "github.com/brown-csci1680/iptcp-headers"
 	"github.com/google/netstack/tcpip/header"
@@ -18,7 +20,9 @@ import (
 
 // General
 const (
-	MaxMessageSize = 1400
+	MaxMessageSize                     = 1400
+	RoutingTableCleanupInterval uint16 = 10
+	RouteTimeout                uint16 = 12
 )
 
 // Routing mode
@@ -54,6 +58,7 @@ type IPStack struct {
 	Neighbors           []Neighbor
 	RoutingMode         RoutingMode
 	RipNeighbors        []netip.Addr
+	RoutingTableMutex   sync.Mutex
 	RoutingTable        []Route
 	RecvHandlerRegistry map[int]HandlerFunc
 }
@@ -77,29 +82,14 @@ type Route struct {
 	RouteType RouteType
 	Prefix    netip.Prefix
 	NextHop   NextHop
-	Cost      int
+	Cost      uint32
+	UpdatedAt time.Time
 }
 
 type NextHop struct {
 	InterfaceName string
 	Addr          netip.Addr
 }
-
-// --this is for the RIP message --//
-
-// type RIPEntry struct {
-// 	Cost    uint32
-// 	Address uint32
-// 	Mask   uint32
-// }
-
-type RIPMessage struct {
-	Command    uint16
-	NumEntries uint16
-	Entries    []byte
-}
-
-// --------------------------------- //
 
 // Initializes the IPStack using the IPConfig provided.
 // Populates the routing table.
@@ -144,7 +134,7 @@ func Initialize(configInfo *lnxconfig.IPConfig) *IPStack {
 				InterfaceName: "",
 				Addr:          addr,
 			},
-			Cost: -1,
+			Cost: 0,
 		})
 	}
 
@@ -214,7 +204,9 @@ func (ipStack *IPStack) SetInterfaceState(interfaceName string, isUp bool) error
 
 // Sending IP messages to the provided destination
 func (ipStack *IPStack) SendIP(dst netip.Addr, protocolNum uint8, data []byte) (int, error) {
+	ipStack.RoutingTableMutex.Lock()
 	route, nextHopUDPAddr, err := ipStack.getRouteForDest(dst)
+	ipStack.RoutingTableMutex.Unlock()
 	if err != nil {
 		return 0, err
 	}
@@ -271,7 +263,9 @@ func (ipStack *IPStack) ForwardIP(hdr *ipv4header.IPv4Header, data []byte) {
 		slog.Warn("Dropping packet, TTL expired")
 		return
 	}
+	ipStack.RoutingTableMutex.Lock()
 	route, nextHopUDPAddr, err := ipStack.getRouteForDest(hdr.Dst)
+	ipStack.RoutingTableMutex.Unlock()
 	if err != nil {
 		slog.Warn("Failed to forward packet, no route found")
 		return
@@ -357,7 +351,7 @@ func (ipStack *IPStack) RecvIP(data []byte) {
 	if reachedDst { // Packet reached its dst, call handler
 		handlerFunc, ok := ipStack.RecvHandlerRegistry[protocolNum]
 		if !ok {
-			slog.Warn("Dropping packet, unsuported protocol num: ", protocolNum)
+			slog.Warn("Dropping packet", "unsuported protocol num", protocolNum)
 			return
 		}
 
@@ -373,9 +367,31 @@ func (ipStack *IPStack) RegisterRecvHandler(protocolNum uint8, callbackFunc Hand
 	ipStack.RecvHandlerRegistry[int(protocolNum)] = callbackFunc
 }
 
+// Cleanup any stale entries in Routing table. Runs as a go routine
+func (ipStack *IPStack) BeginRoutingTableCleanup() {
+	for {
+		time.Sleep(time.Duration(RoutingTableCleanupInterval) * time.Second)
+		ipStack.RoutingTableMutex.Lock()
+		var cleanRoutingTable []Route
+		// Copy all routes to clean table except for expired routes
+		for _, route := range ipStack.RoutingTable {
+			if route.RouteType == RouteTypeRIP {
+				elapsedTime := time.Since(route.UpdatedAt)
+				if elapsedTime > time.Duration(RouteTimeout)*time.Second {
+					// Do not copy a stale route
+					continue
+				}
+			}
+			cleanRoutingTable = append(cleanRoutingTable, route)
+		}
+		ipStack.RoutingTable = cleanRoutingTable
+		ipStack.RoutingTableMutex.Unlock()
+	}
+}
+
 // ---------- IPStack Helper Methods ----------
 
-// Given an interface name return the interface
+// Given an interface name return the interface.
 func (ipStack *IPStack) getInterfaceByName(interfaceName string) (*Interface, error) {
 	for idx, iface := range ipStack.Interfaces {
 		if iface.Name == interfaceName {
@@ -471,9 +487,9 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 	if !iface.IsUp {
 		return 0, nil
 	}
-
 	// Turn the address string into a UDPAddr for the connection
 	addrString := dstUDPAddr.String()
+
 	remoteAddr, err := net.ResolveUDPAddr("udp4", addrString)
 	if err != nil {
 		slog.Warn("Error resolving address:  ", err)
@@ -493,26 +509,8 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 	return bytesWritten, nil
 }
 
-// Listen on the interface for packets
-func (iface *Interface) InitAndListenLinkLayer(ipStack *IPStack) {
-	// Get the address structure for the address on which we want to listen
-	listenString := iface.UDPAddr.String()
-	listenAddr, err := net.ResolveUDPAddr("udp4", listenString)
-	if err != nil {
-		slog.Warn("Error resolving address:  ", err)
-		return
-	}
-
-	// Create a socket and bind it to the port on which we want to receive data
-	conn, err := net.ListenUDP("udp4", listenAddr)
-	if err != nil {
-		slog.Warn("Could not bind to UDP port for %s: ", listenString, err)
-		return
-	}
-
-	// Initialize connection and use it to listen and send UDP packets
-	iface.Conn = conn
-
+// Listen continuously on the interface for IP packets
+func (iface *Interface) ListenLinkLayer(ipStack *IPStack) {
 	for {
 		buffer := make([]byte, MaxMessageSize)
 		// Read on the UDP port
@@ -525,6 +523,31 @@ func (iface *Interface) InitAndListenLinkLayer(ipStack *IPStack) {
 
 		}
 	}
+}
+
+// Init the interfaces by making connection and then
+// listen on the interface for packets on a separate go routine
+func (iface *Interface) InitAndListenLinkLayer(ipStack *IPStack) error {
+	// Get the address structure for the address on which we want to listen
+	listenString := iface.UDPAddr.String()
+	listenAddr, err := net.ResolveUDPAddr("udp4", listenString)
+	if err != nil {
+		slog.Warn("Error resolving address:  ", err)
+		return err
+	}
+
+	// Create a socket and bind it to the port on which we want to receive data
+	conn, err := net.ListenUDP("udp4", listenAddr)
+	if err != nil {
+		slog.Warn("Could not bind to UDP port for %s: ", listenString, err)
+		return err
+	}
+
+	// Initialize connection and use it to listen and send UDP packets
+	iface.Conn = conn
+	go iface.ListenLinkLayer(ipStack)
+
+	return nil
 }
 
 // ---------- Route Methods ----------
@@ -554,13 +577,8 @@ func (route *Route) getNextHopEntry() string {
 }
 
 func (route *Route) getCostEntry() string {
-	if route.Cost == -1 {
+	if route.RouteType == RouteTypeStatic {
 		return "-"
 	}
-	return strconv.Itoa(route.Cost)
-}
-
-// function that listen the RIP update message and update the route table
-func listenAndUpdate(ipStack *IPStack) {
-
+	return strconv.Itoa(int(route.Cost))
 }
