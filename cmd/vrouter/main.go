@@ -15,8 +15,6 @@ func main() {
 		slog.Error("usage: %s --config <lnx file>", os.Args[0])
 	}
 
-	// fmt.Println("my_imp")
-
 	// Change logging level
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	slog.SetDefault(logger)

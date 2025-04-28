@@ -42,12 +42,6 @@ func Initialize(ipStack *ip.IPStack) *TCPStack {
 }
 
 func (tcpStack *TCPStack) VListen(port uint16) (*VTCPListener, error) {
-	// sockTableEntry := SocketTableEntry{
-	// 	LAddr: netip.IPv4Unspecified(),
-	// 	LPort: port,
-	// 	RAddr: netip.IPv4Unspecified(),
-	// 	RPort: 0,
-	// }
 	for _, entry := range tcpStack.SocketTable {
 		if entry.LAddr == netip.IPv4Unspecified() && entry.LPort == port {
 			return nil, errors.New("Port already in use")
