@@ -154,7 +154,6 @@ func SendRIPRequest(ipStack *ip.IPStack) error {
 		if err != nil {
 			slog.Warn("Failed to send msg. ", err)
 		}
-		slog.Debug("RIP request sent to: %s", ripNbor.String())
 	}
 	return nil
 }
@@ -171,7 +170,6 @@ func SendRIPResponse(ipStack *ip.IPStack, dst netip.Addr, ripMsg RIPMessage) err
 		slog.Warn("Failed to send msg. ", err)
 		return err
 	}
-	slog.Debug("RIP response sent", "to", dst.String())
 	return nil
 }
 
@@ -189,8 +187,6 @@ func RIPPacketHandler(ipStack *ip.IPStack, data []byte) {
 	// Unmarshall to RIPMessage
 	ripMsg := RIPMessage{}
 	ripMsg.Unmarshal(message)
-
-	slog.Debug("Received RIP message: %s", ripMsg)
 
 	if ripMsg.Command == RequestCommand { // If RIP Request, send response
 		ripResp := RIPMessage{

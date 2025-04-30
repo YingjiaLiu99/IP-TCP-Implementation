@@ -253,7 +253,6 @@ func (ipStack *IPStack) SendIP(dst netip.Addr, protocolNum uint8, data []byte) (
 	bytesToSend = append(bytesToSend, data...)
 
 	n, err := iface.SendLinkLayer(nextHopUDPAddr, bytesToSend)
-	slog.Info("Sent %d bytes", n)
 	return n, err
 }
 
@@ -299,12 +298,11 @@ func (ipStack *IPStack) ForwardIP(hdr *ipv4header.IPv4Header, data []byte) {
 	bytesToSend = append(bytesToSend, headerBytes...)
 	bytesToSend = append(bytesToSend, data...)
 
-	n, err := iface.SendLinkLayer(nextHopUDPAddr, bytesToSend)
+	_, err = iface.SendLinkLayer(nextHopUDPAddr, bytesToSend)
 	if err != nil {
 		slog.Warn("Failed to forward packet, Error sending over link layer:  ", err)
 		return
 	}
-	slog.Info("Sent %d bytes", n)
 }
 
 // Recv IP messages, the content is passed by interface (Link Layer) process it as IP packet
@@ -413,15 +411,12 @@ func (ipStack *IPStack) getInterfaceStateByName(interfaceName string) bool {
 
 // Given a dest IP return the route it would take from the routing table
 func (ipStack *IPStack) getRouteForDest(dst netip.Addr) (Route, netip.AddrPort, error) {
-	slog.Debug("dst: ", dst)
 	destRoute := Route{}
 	for _, route := range ipStack.RoutingTable {
 		if route.Prefix.Contains(dst) && (destRoute == Route{} || route.Prefix.Bits() > destRoute.Prefix.Bits()) {
 			destRoute = route
 		}
 	}
-
-	slog.Debug("Dest route: ", destRoute)
 
 	var nextHopUDPAddr netip.AddrPort
 	var err error = nil
@@ -447,7 +442,6 @@ func (ipStack *IPStack) getRouteForDest(dst netip.Addr) (Route, netip.AddrPort, 
 				}
 			}
 		}
-		slog.Debug("Next hop UDP addr to send: ", nextHopUDPAddr)
 	} else {
 		destRoute, nextHopUDPAddr, err = ipStack.getRouteForDest(destRoute.NextHop.Addr)
 	}
@@ -496,16 +490,12 @@ func (iface *Interface) SendLinkLayer(dstUDPAddr netip.AddrPort, bytesToSend []b
 		return 0, err
 	}
 
-	slog.Debug("Sending to %s:%d\n",
-		remoteAddr.IP.String(), remoteAddr.Port)
-
 	// Send the message to the "link-layer" addr:port on UDP
 	bytesWritten, err := iface.Conn.WriteToUDP(bytesToSend, remoteAddr)
 	if err != nil {
 		slog.Warn("Error writing to socket: ", err)
 		return 0, err
 	}
-	slog.Debug("Sent %d bytes\n", bytesWritten)
 	return bytesWritten, nil
 }
 

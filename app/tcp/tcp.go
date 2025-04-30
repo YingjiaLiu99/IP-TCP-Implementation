@@ -3,13 +3,8 @@ package tcp
 import (
 	"IP-TCP-Implementation/app/ip"
 	"IP-TCP-Implementation/app/iptcp_utils"
-	"errors"
-	"fmt"
 	"log/slog"
-	"math/rand/v2"
 	"net/netip"
-	"os"
-	"text/tabwriter"
 
 	ipv4header "github.com/brown-csci1680/iptcp-headers"
 	"github.com/google/netstack/tcpip/header"
@@ -20,6 +15,7 @@ const (
 	EphemeralPortRangeLow uint16 = 1025
 	EphemeralPortRangeHi  uint16 = 65535
 	MaxWindowSize         uint16 = 65535
+	MaxTCPPayloadSize     uint16 = 512
 )
 
 type State uint16
@@ -64,7 +60,36 @@ type VTCPConn struct {
 	HandshakeRecAck    chan bool
 	Seq                uint32
 	Ack                uint32
-	WindowSize         uint16
+	TransmittedSegs    []SEG
+	SND                SND
+	RCV                RCV
+	RemoteWindowSize   uint16
+	RemoteCanRecv      chan bool
+}
+
+type SEG struct {
+	SEQ uint32
+	ACK uint32
+	LEN uint16
+	WND uint16
+}
+
+type SND struct {
+	buf            []byte
+	UNA            uint16
+	NXT            uint16
+	WND            uint16
+	LBW            uint16
+	SpaceAvailable chan bool
+	DataAvailable  chan bool
+}
+
+type RCV struct {
+	buf           []byte
+	NXT           uint16
+	WND           uint16
+	LBR           uint16
+	DataAvailable chan bool
 }
 
 type TCPStack struct {
@@ -85,88 +110,6 @@ func Initialize(ipStack *ip.IPStack) *TCPStack {
 	}
 	ipStack.RegisterRecvHandler(TcpProtocolNumber, tcpStack.TCPPacketHandler)
 	return tcpStack
-}
-
-// VListen creates a new listening socket bound to the specified port.
-// After binding, this socket moves into the LISTEN state
-func (tcpStack *TCPStack) VListen(port uint16) (*VTCPListener, error) {
-	_, err := tcpStack.FindListener(port) // expects to give error
-	if err == nil {                       // a listener is found
-		slog.Warn("Port already in use")
-		return nil, errors.New("port already in use")
-	}
-
-	listener := VTCPListener{
-		TcpStack: tcpStack,
-		sId:      tcpStack.SockCouter,
-		lAddr:    netip.IPv4Unspecified(),
-		lPort:    port,
-		rAddr:    netip.IPv4Unspecified(),
-		rPort:    0,
-		state:    LISTEN,
-		NewConns: make(chan *VTCPConn),
-	}
-	tcpStack.SocketTable[tcpStack.SockCouter] = &listener
-	fmt.Println("Created listen socket with ID", tcpStack.SockCouter)
-	tcpStack.SockCouter += 1
-	tcpStack.EphemeralPortSet[port] = true
-	return &listener, nil
-}
-
-// This function creates a new socket that connects to the specified virtual IP address and
-// port–this corresponds to an “active OPEN” in the RFC.
-// VConnect MUST block until the connection is established, or an error occurs.
-func (tcpStack *TCPStack) VConnect(addr netip.Addr, port uint16) (VTCPConn, error) {
-	ephemeralPort, err := tcpStack.FindUnusedPort()
-	if err != nil {
-		slog.Warn("All ports are being used")
-		return VTCPConn{}, err
-	}
-	conn := VTCPConn{
-		TcpStack:           tcpStack,
-		sId:                tcpStack.SockCouter,
-		lAddr:              tcpStack.IpStack.Interfaces[0].AssignedIP, // Since each host has only one iface
-		lPort:              ephemeralPort,
-		rAddr:              addr,
-		rPort:              port,
-		HandshakeRecSynAck: make(chan bool),
-		HandshakeRecAck:    make(chan bool),
-		Seq:                rand.Uint32(), // ISN
-		Ack:                0,
-		WindowSize:         MaxWindowSize,
-	}
-	tcpStack.SocketTable[tcpStack.SockCouter] = &conn
-	fmt.Println("Created listen socket with ID", tcpStack.SockCouter)
-	tcpStack.SockCouter += 1
-	tcpStack.EphemeralPortSet[ephemeralPort] = true
-
-	// Send SYN
-	_, err = tcpStack.SendTCP(&conn, header.TCPFlagSyn, []byte{})
-	if err != nil {
-		slog.Warn("Failed to send SYN")
-		delete(tcpStack.SocketTable, conn.SId())
-		tcpStack.SockCouter -= 1
-		delete(tcpStack.EphemeralPortSet, ephemeralPort)
-		return VTCPConn{}, errors.New("failed to send syn")
-	}
-	conn.state = SYN_SENT
-
-	// Wait for SYN+ACK
-	if <-conn.HandshakeRecSynAck { // TODO: timeout if SYN+ACK not rec
-		// Send ACK
-		conn.Seq += 1
-		_, err = tcpStack.SendTCP(&conn, header.TCPFlagAck, []byte{})
-		if err != nil {
-			slog.Warn("Failed to send ACK")
-			delete(tcpStack.SocketTable, conn.SId())
-			tcpStack.SockCouter -= 1
-			delete(tcpStack.EphemeralPortSet, ephemeralPort)
-			return VTCPConn{}, errors.New("failed to send ack")
-		}
-		conn.state = ESTABLISHED
-	}
-	fmt.Println("Created new socket with ID", conn.SId())
-	return conn, nil
 }
 
 // Handler for TCP command, called when TCP packet recd.
@@ -196,6 +139,8 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 		return
 	}
 
+	slog.Debug("Rec", "Flags", iptcp_utils.TCPFlagsAsString(tcpHdr.Flags))
+
 	var conn *VTCPConn = nil
 	var listener *VTCPListener = nil
 
@@ -217,19 +162,15 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 	if listener != nil {
 		// SYN rec for listener -> create a new conn and send it to chan NewConns
 		if tcpHdr.Flags == header.TCPFlagSyn {
-			newConn := VTCPConn{
-				TcpStack:           tcpStack,
-				sId:                tcpStack.SockCouter,
-				lAddr:              tcpStack.IpStack.Interfaces[0].AssignedIP, // Since each host has only one iface
-				lPort:              listener.LPort(),
-				rAddr:              hdr.Src,
-				rPort:              tcpHdr.SrcPort,
-				HandshakeRecSynAck: make(chan bool),
-				HandshakeRecAck:    make(chan bool),
-				Seq:                rand.Uint32(), // ISN
-				Ack:                tcpHdr.SeqNum + 1,
-				WindowSize:         MaxWindowSize,
-			}
+
+			newConn := NewVTCPConn(tcpStack)
+			newConn.lAddr = tcpStack.IpStack.Interfaces[0].AssignedIP // Since each host has only one iface
+			newConn.lPort = listener.LPort()
+			newConn.rAddr = hdr.Src
+			newConn.rPort = tcpHdr.SrcPort
+			newConn.Ack = tcpHdr.SeqNum + 1
+			newConn.RemoteWindowSize = tcpHdr.WindowSize
+
 			tcpStack.SocketTable[tcpStack.SockCouter] = &newConn
 			slog.Info("New conn created from listen socket", "ID", tcpStack.SockCouter)
 			tcpStack.SockCouter += 1
@@ -245,12 +186,40 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 			// SYN+ACK rec when in SYN_SENT -> inform chan HandshakeRecSynAck
 			if tcpHdr.Flags == header.TCPFlagSyn|header.TCPFlagAck {
 				conn.Ack = tcpHdr.SeqNum + 1
+				conn.RemoteWindowSize = tcpHdr.WindowSize
 				conn.HandshakeRecSynAck <- true
 			}
 		} else if conn.State() == SYN_RECEIVED {
 			// ACK rec when in SYN_RECEIVED -> inform chan HandshakeRecAck
 			if tcpHdr.Flags == header.TCPFlagAck {
 				conn.HandshakeRecAck <- true
+			}
+		} else if conn.State() == ESTABLISHED {
+			if tcpHdr.SeqNum == conn.Ack { // expected segment
+				if conn.RCV.WND >= uint16(len(tcpPayload)) { // if the payload is too big it will be dropped
+					signalDataAvailable := false
+					if conn.RCV.LBR+1 == conn.RCV.NXT { // check if there was no data to be read
+						signalDataAvailable = true // in which case now inform there is
+					}
+					for i := 0; i < len(tcpPayload); i++ {
+						conn.RCV.buf[conn.RCV.NXT] = tcpPayload[i]
+						conn.RCV.NXT = Mod(conn.RCV.NXT + 1)
+					}
+					if signalDataAvailable {
+						conn.RCV.DataAvailable <- true
+					}
+					conn.Ack += uint32(len(tcpPayload))
+
+				}
+			}
+			// TODO: early arrivals
+			// else if tcpHdr.SeqNum == conn.Ack { // early arrival segment
+			// }
+			for _, seg := range conn.TransmittedSegs {
+				if seg.ACK <= tcpHdr.AckNum {
+					conn.SND.UNA = Mod(conn.SND.UNA + seg.WND)
+					conn.SND.WND = Mod(conn.SND.WND + seg.WND)
+				}
 			}
 		}
 
@@ -267,7 +236,7 @@ func (tcpStack *TCPStack) SendTCP(conn *VTCPConn, flags uint8, payload []byte) (
 		AckNum:        conn.Ack,
 		DataOffset:    20,
 		Flags:         flags,
-		WindowSize:    conn.WindowSize,
+		WindowSize:    conn.RCV.WND,
 		Checksum:      0,
 		UrgentPointer: 0,
 	}
@@ -285,168 +254,7 @@ func (tcpStack *TCPStack) SendTCP(conn *VTCPConn, flags uint8, payload []byte) (
 	ipPacketPayload = append(ipPacketPayload, tcpHeaderBytes...)
 	ipPacketPayload = append(ipPacketPayload, []byte(payload)...)
 
-	slog.Debug("Conn", "id", conn.SId())
 	bytesWritten, err := tcpStack.IpStack.SendIP(conn.RAddr(), TcpProtocolNumber, ipPacketPayload)
 
 	return bytesWritten, err
-}
-
-// Searches for a listener socket with the given port
-func (tcpStack *TCPStack) FindListener(port uint16) (*VTCPListener, error) {
-	for id, entry := range tcpStack.SocketTable {
-		if entry.LAddr() == netip.IPv4Unspecified() && entry.LPort() == port {
-			listener, ok := tcpStack.SocketTable[id].(*VTCPListener)
-			if !ok {
-				slog.Warn("Could not assert type to a VTCPListener")
-				return nil, errors.New("could not assert to listener")
-			}
-			return listener, nil
-		}
-	}
-	return nil, errors.New("listener not found")
-}
-
-// Searches if a listener port with the given port exists
-func (tcpStack *TCPStack) FindConn(recLAddr netip.Addr, recLPort uint16, recRAddr netip.Addr, recRPort uint16) (*VTCPConn, error) {
-	for id, entry := range tcpStack.SocketTable {
-		if entry.LAddr() == recRAddr && entry.LPort() == recRPort && entry.RAddr() == recLAddr && entry.RPort() == recLPort {
-			conn, ok := tcpStack.SocketTable[id].(*VTCPConn)
-			if !ok {
-				slog.Warn("Could not assert type to a VTCPConn")
-				return nil, errors.New("could not assert to conn")
-			}
-			return conn, nil
-		}
-	}
-	return nil, errors.New("conn not found")
-}
-
-// Find Unused Port by going through port rannge and checking if being used
-func (tcpStack *TCPStack) FindUnusedPort() (uint16, error) {
-	for i := EphemeralPortRangeLow; i <= EphemeralPortRangeHi; i++ {
-		_, ok := tcpStack.EphemeralPortSet[i]
-		if !ok {
-			return i, nil
-		}
-	}
-	return 0, errors.New("no port left")
-}
-
-// Prints the socket table
-func (tcpStack *TCPStack) PrintSocketTable() {
-	w := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
-	fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", "SID", "LAddr", "Lport", "RAddr", "RPort", "Status")
-	for _, entry := range tcpStack.SocketTable {
-		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%d\t%s\n", entry.SId(), entry.LAddr(), entry.LPort(), entry.RAddr(), entry.RPort(), entry.State())
-	}
-	w.Flush()
-}
-
-//  VTCPListener methods
-
-func (listener *VTCPListener) VAccept() (*VTCPConn, error) {
-	conn := <-listener.NewConns
-	conn.state = SYN_RECEIVED
-
-	tcpStack := listener.TcpStack
-
-	// Send SYN+ACK
-	_, err := tcpStack.SendTCP(conn, header.TCPFlagSyn|header.TCPFlagAck, []byte{})
-	if err != nil {
-		slog.Warn("Failed to send SYN+ACK")
-		delete(tcpStack.SocketTable, conn.SId())
-		tcpStack.SockCouter -= 1
-		// CONSIDER: removeing if was added in set
-		// delete(tcpStack.EphemeralPortSet, conn.RPort())
-		return nil, errors.New("failed to send syn+ack")
-	}
-
-	// Wait for ACK
-	if <-conn.HandshakeRecAck { // TODO: timeout if ACK not rec
-		// Send ACK
-		conn.Seq += 1
-		conn.state = ESTABLISHED
-	}
-	fmt.Printf("New connection on socket %d => created new socket %d\n", listener.SId(), conn.SId())
-	fmt.Print("> ")
-	return conn, nil
-}
-
-func (listener *VTCPListener) PassiveOpen() {
-	for {
-		listener.VAccept()
-	}
-}
-
-// Getters to implement Socket
-
-func (listener *VTCPListener) SId() uint16 {
-	return listener.sId
-}
-
-func (listener *VTCPListener) LAddr() netip.Addr {
-	return listener.lAddr
-}
-
-func (listener *VTCPListener) LPort() uint16 {
-	return listener.lPort
-}
-
-func (listener *VTCPListener) RAddr() netip.Addr {
-	return listener.rAddr
-}
-
-func (listener *VTCPListener) RPort() uint16 {
-	return listener.rPort
-}
-
-func (listener *VTCPListener) State() State {
-	return listener.state
-}
-
-//  VTCPConn methods to implement Socket
-
-// Getters
-
-func (conn *VTCPConn) SId() uint16 {
-	return conn.sId
-}
-
-func (conn *VTCPConn) LAddr() netip.Addr {
-	return conn.lAddr
-}
-
-func (conn *VTCPConn) LPort() uint16 {
-	return conn.lPort
-}
-
-func (conn *VTCPConn) RAddr() netip.Addr {
-	return conn.rAddr
-}
-
-func (conn *VTCPConn) RPort() uint16 {
-	return conn.rPort
-}
-
-func (conn *VTCPConn) State() State {
-	return conn.state
-}
-
-// State
-
-func (state State) String() string {
-	switch state {
-	case CLOSED:
-		return "CLOSED"
-	case LISTEN:
-		return "LISTEN"
-	case SYN_SENT:
-		return "SYN_SENT"
-	case SYN_RECEIVED:
-		return "SYN_RECEIVED"
-	case ESTABLISHED:
-		return "ESTABLISHED"
-	default:
-		return ""
-	}
 }

@@ -15,6 +15,8 @@ func main() {
 		slog.Error("usage: %s --config <lnx file>", os.Args[0])
 	}
 
+	// fmt.Println("my_imp")
+
 	// Change logging level
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	slog.SetDefault(logger)
@@ -28,11 +30,9 @@ func main() {
 	}
 
 	ipStack := ip.Initialize(configInfo)
-	slog.Debug("IP stack initialized to: ", ipStack)
 
 	// Set up all interfaces to listen and respond
-	for idx, iface := range ipStack.Interfaces {
-		slog.Debug("Start serving %s", iface.UDPAddr)
+	for idx, _ := range ipStack.Interfaces {
 		err = ipStack.Interfaces[idx].InitAndListenLinkLayer(ipStack)
 		if err != nil {
 			slog.Error("Failed to init the interface. Err: ", err)

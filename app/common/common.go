@@ -113,8 +113,6 @@ func RunREPLExtended(ipStack *ip.IPStack, tcpStack *tcp.TCPStack) {
 				go listener.PassiveOpen()
 			}
 		case "c":
-			// vip := words[1]
-			// port := words[2]
 			if len(words) < 3 {
 				fmt.Println("Usage: c <ip> <port>")
 				fmt.Print("> ")
@@ -136,6 +134,77 @@ func RunREPLExtended(ipStack *ip.IPStack, tcpStack *tcp.TCPStack) {
 			if err != nil {
 				fmt.Println("Failed to connect")
 			}
+		case "s":
+			if len(words) < 3 {
+				fmt.Println("Usage: s <socket ID> <data>")
+				fmt.Print("> ")
+				continue
+			}
+			sid, err := strconv.Atoi(words[1])
+			if err != nil {
+				fmt.Println("<socket ID> must be an integer")
+				fmt.Print("> ")
+				continue
+			}
+			data := strings.Join(words[2:], " ")
+
+			sock, ok := tcpStack.SocketTable[uint16(sid)]
+			if !ok {
+				fmt.Println("socket not found")
+				fmt.Print("> ")
+				continue
+			}
+			conn, ok := sock.(*tcp.VTCPConn)
+			if !ok {
+				fmt.Println("socket not of type conn")
+				fmt.Print("> ")
+				continue
+			}
+			n, err := conn.VWrite([]byte(data))
+			if err != nil {
+				fmt.Println("Failed to send")
+			} else {
+				fmt.Printf("Wrote %d bytes\n", n)
+			}
+		case "r":
+			if len(words) < 3 {
+				fmt.Println("Usage: r <socket ID> <numbytes>")
+				fmt.Print("> ")
+				continue
+			}
+			sid, err := strconv.Atoi(words[1])
+			if err != nil {
+				fmt.Println("<socket ID> must be an integer")
+				fmt.Print("> ")
+				continue
+			}
+			numBytes, err := strconv.Atoi(words[2])
+			if err != nil {
+				fmt.Println("<numbytes> must be an integer")
+				fmt.Print("> ")
+				continue
+			}
+
+			sock, ok := tcpStack.SocketTable[uint16(sid)]
+			if !ok {
+				fmt.Println("socket not found")
+				fmt.Print("> ")
+				continue
+			}
+			conn, ok := sock.(*tcp.VTCPConn)
+			if !ok {
+				fmt.Println("socket not of type conn")
+				fmt.Print("> ")
+				continue
+			}
+			buf := make([]byte, numBytes)
+			n, err := conn.VRead(buf)
+			if err != nil {
+				fmt.Println("Failed to rcv")
+			} else {
+				fmt.Printf("Read %d bytes: %s\n", n, string(buf))
+			}
+
 		default:
 			fmt.Println("Invalid command:")
 			ListCommands(true)
