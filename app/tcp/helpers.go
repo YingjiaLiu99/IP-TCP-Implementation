@@ -10,30 +10,49 @@ import (
 	"text/tabwriter"
 )
 
+type SegPriorityQueue []*SEG
+
+func (pq SegPriorityQueue) Len() int           { return len(pq) }
+func (pq SegPriorityQueue) Less(i, j int) bool { return pq[i].SEQ < pq[j].SEQ }
+
+func (pq *SegPriorityQueue) Push(x *SEG) {
+	*pq = append(*pq, x)
+}
+
+func (pq *SegPriorityQueue) Pop() *SEG {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil // avoid memory leak
+	*pq = old[0 : n-1]
+	return item
+}
+
 // Creates and returns a new VTCPConn
 func NewVTCPConn(tcpStack *TCPStack) VTCPConn {
 	return VTCPConn{
-		TcpStack:           tcpStack,
-		sId:                tcpStack.SockCouter,
-		HandshakeRecSynAck: make(chan bool),
-		HandshakeRecAck:    make(chan bool),
-		Seq:                rand.Uint32(), // ISN
-		RemoteCanRecv:      make(chan bool),
+		TcpStack:      tcpStack,
+		sId:           tcpStack.SockCouter,
+		HandshakeDone: make(chan bool),
+		// HandshakeRecAck:    make(chan bool),
+		// Seq:                rand.Uint32(), // ISN
+		// RemoteCanRecv:      make(chan bool),
+		ISS: rand.Uint32(),
 		SND: SND{
-			buf:            make([]byte, MaxWindowSize),
-			UNA:            0,
-			NXT:            0,
-			WND:            MaxWindowSize,
-			LBW:            MaxWindowSize - 1,
-			SpaceAvailable: make(chan bool),
-			DataAvailable:  make(chan bool),
+			buf: make([]byte, MaxWindowSize),
+			UNA: 0,
+			NXT: 0,
+			WND: MaxWindowSize,
+			// LBW: MaxWindowSize - 1,
+			// SpaceAvailable: make(chan bool),
+			// DataAvailable:  make(chan bool),
 		},
 		RCV: RCV{
-			buf:           make([]byte, MaxWindowSize),
-			NXT:           0,
-			WND:           MaxWindowSize,
-			LBR:           MaxWindowSize - 1,
-			DataAvailable: make(chan bool),
+			buf: make([]byte, MaxWindowSize),
+			NXT: 0,
+			WND: MaxWindowSize,
+			// LBR: MaxWindowSize - 1,
+			// DataAvailable: make(chan bool),
 		},
 	}
 }
@@ -172,4 +191,20 @@ func (state State) String() string {
 
 func Mod(x uint16) uint16 {
 	return x % MaxWindowSize
+}
+
+func ModularLessThan(lhs uint32, rhs uint32, start uint32) bool {
+	if lhs < rhs {
+		return true
+	} else if lhs >= start && rhs < start {
+		return true
+	}
+	return false
+}
+
+func ModularLessThanEqual(lhs uint32, rhs uint32, start uint32) bool {
+	if lhs == rhs {
+		return true
+	}
+	return ModularLessThan(lhs, rhs, start)
 }
