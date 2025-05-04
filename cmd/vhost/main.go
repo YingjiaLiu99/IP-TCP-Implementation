@@ -19,7 +19,7 @@ func main() {
 	// fmt.Println("my_imp")
 
 	// Change logging level
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	slog.SetDefault(logger)
 
 	lnxFile := os.Args[2]

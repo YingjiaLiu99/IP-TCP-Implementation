@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/netip"
 	"os"
+	"sync"
 	"text/tabwriter"
 )
 
@@ -29,32 +30,25 @@ func (pq *SegPriorityQueue) Pop() *SEG {
 }
 
 // Creates and returns a new VTCPConn
-func NewVTCPConn(tcpStack *TCPStack) VTCPConn {
-	return VTCPConn{
+func NewVTCPConn(tcpStack *TCPStack) *VTCPConn {
+	conn := &VTCPConn{
 		TcpStack:      tcpStack,
 		sId:           tcpStack.SockCouter,
 		HandshakeDone: make(chan bool),
-		// HandshakeRecAck:    make(chan bool),
-		// Seq:                rand.Uint32(), // ISN
-		// RemoteCanRecv:      make(chan bool),
-		ISS: rand.Uint32(),
+		ISS:           rand.Uint32(),
 		SND: SND{
-			buf: make([]byte, MaxWindowSize),
-			UNA: 0,
-			NXT: 0,
+			Buf: make([]byte, MaxWindowSize),
 			WND: MaxWindowSize,
-			// LBW: MaxWindowSize - 1,
-			// SpaceAvailable: make(chan bool),
-			// DataAvailable:  make(chan bool),
 		},
 		RCV: RCV{
-			buf: make([]byte, MaxWindowSize),
-			NXT: 0,
+			Buf: make([]byte, MaxWindowSize),
 			WND: MaxWindowSize,
-			// LBR: MaxWindowSize - 1,
-			// DataAvailable: make(chan bool),
 		},
 	}
+	conn.SND.SpaceAvailableCond = sync.NewCond(&conn.SND.BufLock)
+	conn.SND.DataAvailableCond = sync.NewCond(&conn.SND.BufLock)
+	conn.RCV.DataAvailableCond = sync.NewCond(&conn.RCV.BufLock)
+	return conn
 }
 
 // Searches for a listener socket with the given port
@@ -189,8 +183,26 @@ func (state State) String() string {
 	}
 }
 
-func Mod(x uint16) uint16 {
-	return x % MaxWindowSize
+func AcceptableSegSeq(seg *SEG, rcv *RCV, IRS uint32) bool {
+	if seg.LEN == 0 {
+		if rcv.WND == 0 {
+			return seg.SEQ == rcv.NXT
+		} else if rcv.WND > 0 {
+			return ModularLessThanEqual(rcv.NXT, seg.SEQ, IRS) && ModularLessThan(seg.SEQ, rcv.NXT+uint32(rcv.WND), IRS)
+		}
+	} else if seg.LEN > 0 {
+		if rcv.WND == 0 {
+			return false
+		} else if rcv.WND > 0 {
+			return ((ModularLessThanEqual(rcv.NXT, seg.SEQ, IRS) && ModularLessThan(seg.SEQ, rcv.NXT+uint32(rcv.WND), IRS)) ||
+				(ModularLessThanEqual(rcv.NXT, seg.SEQ+uint32(seg.LEN)-1, IRS) && ModularLessThan(seg.SEQ+uint32(seg.LEN)-1, rcv.NXT+uint32(rcv.WND), IRS)))
+		}
+	}
+	return false
+}
+
+func BufIdx(x uint32) uint16 {
+	return uint16(x % uint32(MaxWindowSize))
 }
 
 func ModularLessThan(lhs uint32, rhs uint32, start uint32) bool {
