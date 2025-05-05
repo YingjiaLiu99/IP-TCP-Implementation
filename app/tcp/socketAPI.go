@@ -191,3 +191,44 @@ func (conn *VTCPConn) VWrite(data []byte) (int, error) {
 	conn.SND.BufLock.Unlock()
 	return bytesWritten, nil
 }
+
+func (tcpStack *TCPStack) VClose(sid int) {
+	socket, exists := tcpStack.SocketTable[uint16(sid)]
+	if !exists {
+		slog.Warn("No matching socket id")
+		return
+	}
+	conn := socket.(*VTCPConn)
+	if conn.state == ESTABLISHED {
+		seqStart := conn.SND.NXT
+		seg := SEG{
+			SEQ: seqStart,
+			ACK: conn.RCV.NXT,
+			LEN: 1,
+			WND: conn.RCV.WND,
+		}
+		_, err := tcpStack.SendTCP(conn, header.TCPFlagFin|header.TCPFlagAck, seg, []byte{})
+		if err != nil {
+			slog.Warn("Failed to send FIN|ACK")
+			return
+		}
+		conn.state = FIN_WAIT_1
+		conn.SND.RetransQ.Push(&seg)
+
+	} else if conn.state == CLOSE_WAIT {
+		seqStart := conn.SND.NXT
+		seg := SEG{
+			SEQ: seqStart,
+			ACK: conn.RCV.NXT,
+			LEN: 1,
+			WND: conn.RCV.WND,
+		}
+		_, err := tcpStack.SendTCP(conn, header.TCPFlagFin|header.TCPFlagAck, seg, []byte{})
+		if err != nil {
+			slog.Warn("Failed to send FIN|ACK")
+			return
+		}
+		conn.state = LAST_ACK
+		conn.SND.RetransQ.Push(&seg)
+	}
+}

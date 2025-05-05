@@ -178,6 +178,16 @@ func (state State) String() string {
 		return "SYN_RECEIVED"
 	case ESTABLISHED:
 		return "ESTABLISHED"
+	case FIN_WAIT_1:
+		return "FIN_WAIT_1"
+	case FIN_WAIT_2:
+		return "FIN_WAIT_2"
+	case CLOSE_WAIT:
+		return "CLOSE_WAIT"
+	case LAST_ACK:
+		return "LAST_ACK"
+	case TIME_WAIT:
+		return "TIME_WAIT"
 	default:
 		return ""
 	}

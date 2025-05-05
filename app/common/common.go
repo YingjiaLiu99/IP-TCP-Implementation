@@ -166,6 +166,19 @@ func RunREPLExtended(ipStack *ip.IPStack, tcpStack *tcp.TCPStack) {
 			} else {
 				fmt.Printf("Wrote %d bytes\n", n)
 			}
+		case "cl":
+			if len(words) != 2 {
+				fmt.Println("Usage: cl <socket ID>")
+				fmt.Print("> ")
+				continue
+			}
+			sid, err := strconv.Atoi(words[1])
+			if err != nil {
+				fmt.Println("<socket ID> must be an integer")
+				fmt.Print("> ")
+				continue
+			}
+			tcpStack.VClose(sid)
 		case "r":
 			if len(words) < 3 {
 				fmt.Println("Usage: r <socket ID> <numbytes>")
