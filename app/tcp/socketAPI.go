@@ -3,6 +3,7 @@ package tcp
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 
@@ -42,7 +43,16 @@ func (tcpStack *TCPStack) VListen(port uint16) (*VTCPListener, error) {
 // VAccept waits for new TCP connections on the given listening socket.
 // If no new clients have connected, this function MUST block until a new connection occurs.
 func (listener *VTCPListener) VAccept() (*VTCPConn, error) {
-	conn := <-listener.NewConns // Get a newly created conn
+	listener.SockLock.Lock()
+	if listener.State() != LISTEN {
+		listener.SockLock.Unlock()
+		return nil, errors.New("closing")
+	}
+	listener.SockLock.Unlock()
+	conn, ok := <-listener.NewConns // Get a newly created conn
+	if conn == nil || !ok {
+		return nil, errors.New("closing")
+	}
 
 	// Wait for handshake to complete
 	<-conn.HandshakeDone // TODO: timeout if handshake not done
@@ -53,6 +63,19 @@ func (listener *VTCPListener) VAccept() (*VTCPConn, error) {
 	slog.Info("Conn.RCV", "RCV.NXT", conn.RCV.NXT, "RCV.LBR", conn.RCV.LBR)
 	fmt.Print("> ")
 	return conn, nil
+}
+
+// Closes this listening socket, removing it from the socket table.
+// No new connection may be made on this socket.
+// Any pending requests to create new connections should be deleted.
+func (listener *VTCPListener) VClose() error {
+	listener.TcpStack.CtrlLock.Lock()
+	listener.state = CLOSED
+	delete(listener.TcpStack.SocketTable, listener.sId)
+	delete(listener.TcpStack.EphemeralPortSet, listener.LPort())
+	close(listener.NewConns)
+	defer listener.TcpStack.CtrlLock.Unlock()
+	return nil
 }
 
 // This function creates a new socket that connects to the specified virtual IP address and
@@ -80,12 +103,13 @@ func (tcpStack *TCPStack) VConnect(addr netip.Addr, port uint16) (*VTCPConn, err
 
 	// Send SYN
 	synSeg := SEG{
-		SEQ: conn.ISS,
-		ACK: 0,
-		LEN: 1, // SYN is of len 1 but no data
-		WND: conn.RCV.WND,
+		SEQ:   conn.ISS,
+		ACK:   0,
+		LEN:   1, // SYN is of len 1 but no data
+		WND:   conn.RCV.WND,
+		Flags: header.TCPFlagSyn,
 	}
-	_, err = tcpStack.SendTCP(conn, header.TCPFlagSyn, synSeg, []byte{})
+	_, err = tcpStack.SendTCP(conn, synSeg, []byte{})
 	if err != nil {
 		slog.Warn("Failed to send SYN")
 		tcpStack.CtrlLock.Lock()
@@ -115,6 +139,11 @@ func (tcpStack *TCPStack) VConnect(addr netip.Addr, port uint16) (*VTCPConn, err
 // This method reads data from the TCP socket (equivalent to RECEIVE in RFC).
 // In this version, data is read into a slice (buf) passed as argument.
 func (conn *VTCPConn) VRead(buf []byte) (int, error) {
+	conn.SockLock.Lock()
+	if conn.State() != ESTABLISHED && conn.State() != CLOSE_WAIT {
+		return 0, io.EOF
+	}
+	conn.SockLock.Unlock()
 	conn.RCV.BufLock.Lock()
 	for !ModularLessThan(conn.RCV.LBR+1, conn.RCV.NXT, conn.IRS) { // check if no data available to be read
 		conn.RCV.DataAvailableCond.Wait() // unblock only when data available to be read
@@ -149,12 +178,13 @@ func (conn *VTCPConn) TransmitData() {
 		}
 
 		sendSeg := SEG{
-			SEQ: seqStart,
-			ACK: conn.RCV.NXT,
-			LEN: payloadSize,
-			WND: conn.RCV.WND,
+			SEQ:   seqStart,
+			ACK:   conn.RCV.NXT,
+			LEN:   payloadSize,
+			WND:   conn.RCV.WND,
+			Flags: header.TCPFlagAck,
 		}
-		_, err := conn.TcpStack.SendTCP(conn, header.TCPFlagAck, sendSeg, payload)
+		_, err := conn.TcpStack.SendTCP(conn, sendSeg, payload)
 		if err != nil {
 			conn.SND.NXT = seqStart
 			slog.Warn("Failed to transmit data")
@@ -168,6 +198,12 @@ func (conn *VTCPConn) TransmitData() {
 // This method writes data to the TCP socket (equivalent to SEND in the RFC).
 // In this version, data to write is passed as a byte slice (data).
 func (conn *VTCPConn) VWrite(data []byte) (int, error) {
+	conn.SockLock.Lock()
+	if conn.State() != ESTABLISHED && conn.State() != CLOSE_WAIT {
+		return 0, io.EOF
+	}
+	conn.SockLock.Unlock()
+
 	bytesWritten := 0
 	conn.SND.BufLock.Lock()
 	for i := 0; i < len(data); i++ {
@@ -182,7 +218,6 @@ func (conn *VTCPConn) VWrite(data []byte) (int, error) {
 		}
 		conn.SND.LBW++
 		conn.SND.Buf[BufIdx(conn.SND.LBW)] = data[i]
-		// conn.SND.WND--
 		bytesWritten++
 	}
 	if bytesWritten > 0 {
@@ -192,43 +227,29 @@ func (conn *VTCPConn) VWrite(data []byte) (int, error) {
 	return bytesWritten, nil
 }
 
-func (tcpStack *TCPStack) VClose(sid int) {
-	socket, exists := tcpStack.SocketTable[uint16(sid)]
-	if !exists {
-		slog.Warn("No matching socket id")
-		return
+// Initiates the connection termination process for this socket (equivalent to CLOSE in the RFC).
+// This method should be used to indicate that the user is done sending/receiving on this socket.
+func (conn *VTCPConn) VClose() error {
+	conn.SockLock.Lock()
+	defer conn.SockLock.Unlock()
+	seg := SEG{
+		SEQ:   conn.SND.NXT,
+		ACK:   conn.RCV.NXT,
+		LEN:   0,
+		WND:   conn.RCV.WND,
+		Flags: header.TCPFlagFin | header.TCPFlagAck,
 	}
-	conn := socket.(*VTCPConn)
+	_, err := conn.TcpStack.SendTCP(conn, seg, []byte{})
+	if err != nil {
+		slog.Warn("Failed to send FIN|ACK")
+		return err
+	}
+	conn.SND.NXT++
+	conn.SND.RetransQ.Push(&seg)
 	if conn.state == ESTABLISHED {
-		seqStart := conn.SND.NXT
-		seg := SEG{
-			SEQ: seqStart,
-			ACK: conn.RCV.NXT,
-			LEN: 1,
-			WND: conn.RCV.WND,
-		}
-		_, err := tcpStack.SendTCP(conn, header.TCPFlagFin|header.TCPFlagAck, seg, []byte{})
-		if err != nil {
-			slog.Warn("Failed to send FIN|ACK")
-			return
-		}
 		conn.state = FIN_WAIT_1
-		conn.SND.RetransQ.Push(&seg)
-
 	} else if conn.state == CLOSE_WAIT {
-		seqStart := conn.SND.NXT
-		seg := SEG{
-			SEQ: seqStart,
-			ACK: conn.RCV.NXT,
-			LEN: 1,
-			WND: conn.RCV.WND,
-		}
-		_, err := tcpStack.SendTCP(conn, header.TCPFlagFin|header.TCPFlagAck, seg, []byte{})
-		if err != nil {
-			slog.Warn("Failed to send FIN|ACK")
-			return
-		}
 		conn.state = LAST_ACK
-		conn.SND.RetransQ.Push(&seg)
 	}
+	return nil
 }

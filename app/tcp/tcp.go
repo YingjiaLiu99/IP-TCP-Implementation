@@ -3,10 +3,10 @@ package tcp
 import (
 	"IP-TCP-Implementation/app/ip"
 	"IP-TCP-Implementation/app/iptcp_utils"
+	"fmt"
 	"log/slog"
 	"net/netip"
 	"sync"
-	"time"
 
 	ipv4header "github.com/brown-csci1680/iptcp-headers"
 	"github.com/google/netstack/tcpip/header"
@@ -17,7 +17,7 @@ const (
 	EphemeralPortRangeLow uint16 = 1025
 	EphemeralPortRangeHi  uint16 = 65535
 	MaxWindowSize         uint16 = 65535
-	MaxSegmentSize        uint16 = 512
+	MaxSegmentSize        uint16 = 1024 // 1360
 	ConnQueueSize                = 32
 )
 
@@ -34,6 +34,7 @@ const (
 	CLOSE_WAIT
 	LAST_ACK
 	TIME_WAIT
+	CLOSING
 )
 
 type Socket interface {
@@ -43,6 +44,7 @@ type Socket interface {
 	RAddr() netip.Addr
 	RPort() uint16
 	State() State
+	VClose() error
 }
 
 type VTCPListener struct {
@@ -54,6 +56,7 @@ type VTCPListener struct {
 	rPort    uint16
 	state    State
 	NewConns chan *VTCPConn
+	SockLock sync.Mutex
 }
 
 type VTCPConn struct {
@@ -69,13 +72,15 @@ type VTCPConn struct {
 	ISS           uint32
 	IRS           uint32
 	HandshakeDone chan bool
+	SockLock      sync.Mutex
 }
 
 type SEG struct {
-	SEQ uint32
-	ACK uint32
-	LEN uint16
-	WND uint16
+	SEQ   uint32
+	ACK   uint32
+	LEN   uint16
+	WND   uint16
+	Flags uint8
 }
 
 type SND struct {
@@ -173,15 +178,16 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 
 	// Recvd segment
 	recSeg := SEG{
-		SEQ: tcpHdr.SeqNum,
-		ACK: tcpHdr.AckNum,
-		LEN: uint16(len(tcpPayload)),
-		WND: tcpHdr.WindowSize,
+		SEQ:   tcpHdr.SeqNum,
+		ACK:   tcpHdr.AckNum,
+		LEN:   uint16(len(tcpPayload)),
+		WND:   tcpHdr.WindowSize,
+		Flags: tcpHdr.Flags,
 	}
 
 	if listener != nil {
 		// SYN rec for listener, create a new conn, send SYN+ACK and send conn to chan NewConns
-		if tcpHdr.Flags == header.TCPFlagSyn {
+		if recSeg.Flags == header.TCPFlagSyn {
 
 			newConn := NewVTCPConn(tcpStack)
 			newConn.lAddr = tcpStack.IpStack.Interfaces[0].AssignedIP // Since each host has only one iface
@@ -194,12 +200,13 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 
 			// Send SYN+ACK
 			sendSeg := SEG{
-				SEQ: newConn.ISS,
-				ACK: newConn.RCV.NXT,
-				LEN: 1, // SYN is of len 1 but no data
-				WND: newConn.RCV.WND,
+				SEQ:   newConn.ISS,
+				ACK:   newConn.RCV.NXT,
+				LEN:   1, // SYN is of len 1 but no data
+				WND:   newConn.RCV.WND,
+				Flags: header.TCPFlagSyn | header.TCPFlagAck,
 			}
-			_, err = tcpStack.SendTCP(newConn, header.TCPFlagSyn|header.TCPFlagAck, sendSeg, []byte{})
+			_, err = tcpStack.SendTCP(newConn, sendSeg, []byte{})
 			if err != nil {
 				slog.Warn("Failed to send SYN+ACK")
 				return
@@ -223,20 +230,26 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 	}
 
 	if conn != nil {
+		conn.SockLock.Lock()
 		conn.RCV.BufLock.Lock()
 		conn.SND.BufLock.Lock()
 		defer conn.SND.BufLock.Unlock()
 		defer conn.RCV.BufLock.Unlock()
+		defer conn.SockLock.Unlock()
 
-		if conn.State() == SYN_SENT {
-			if tcpHdr.Flags&header.TCPFlagAck > 0 { // Ack recvd
+		if conn.State() == CLOSED {
+			slog.Warn("Can't recv on CLOSED conn")
+			return
+
+		} else if conn.State() == SYN_SENT {
+			if recSeg.Flags&header.TCPFlagAck > 0 { // Ack recvd
 				if !(ModularLessThan(conn.SND.UNA, recSeg.ACK, conn.ISS) && ModularLessThanEqual(recSeg.ACK, conn.SND.NXT, conn.ISS)) {
 					return
 				}
 				conn.SND.UNA = recSeg.ACK
 			}
 
-			if tcpHdr.Flags&header.TCPFlagSyn > 0 { // SYN recvd
+			if recSeg.Flags&header.TCPFlagSyn > 0 { // SYN recvd
 				conn.RCV.NXT = recSeg.SEQ + 1
 				conn.IRS = recSeg.SEQ
 
@@ -248,12 +261,13 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 				if ModularLessThan(conn.ISS, conn.SND.UNA, conn.ISS) { // ISS has been acked
 					// send ACK
 					ackSendSeg := SEG{
-						SEQ: conn.SND.NXT,
-						ACK: conn.RCV.NXT,
-						LEN: 0,
-						WND: conn.RCV.WND,
+						SEQ:   conn.SND.NXT,
+						ACK:   conn.RCV.NXT,
+						LEN:   0,
+						WND:   conn.RCV.WND,
+						Flags: header.TCPFlagAck,
 					}
-					_, err = tcpStack.SendTCP(conn, header.TCPFlagAck, ackSendSeg, []byte{})
+					_, err = tcpStack.SendTCP(conn, ackSendSeg, []byte{})
 					if err != nil {
 						slog.Warn("Failed to send ACK")
 						return
@@ -266,12 +280,13 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 					conn.state = SYN_RECEIVED
 					// Send SYN+ACK
 					sendSeg := SEG{
-						SEQ: conn.ISS,
-						ACK: conn.RCV.NXT,
-						LEN: 1, // SYN is of len 1 but no data
-						WND: conn.RCV.WND,
+						SEQ:   conn.ISS,
+						ACK:   conn.RCV.NXT,
+						LEN:   1, // SYN is of len 1 but no data
+						WND:   conn.RCV.WND,
+						Flags: header.TCPFlagSyn | header.TCPFlagAck,
 					}
-					_, err = tcpStack.SendTCP(conn, header.TCPFlagSyn|header.TCPFlagAck, sendSeg, []byte{})
+					_, err = tcpStack.SendTCP(conn, sendSeg, []byte{})
 					if err != nil {
 						slog.Warn("Failed to send SYN+ACK")
 						return
@@ -283,238 +298,242 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 				}
 			}
 
-		} else if conn.State() == SYN_RECEIVED {
-			// ACK rec when in SYN_RECEIVED
-			if ModularLessThan(conn.SND.UNA, recSeg.ACK, conn.ISS) && ModularLessThanEqual(recSeg.ACK, conn.SND.NXT, conn.ISS) {
-				for conn.SND.RetransQ.Len() > 0 && ModularLessThanEqual(conn.SND.RetransQ[0].SEQ+uint32(conn.SND.RetransQ[0].LEN), recSeg.ACK, conn.ISS) {
-					conn.SND.RetransQ.Pop()
-					// Don't update ACK here as transmitted ACK was to validate the remote seq num
-					// We want to update to what we have recvd as ack (our ISS ack'd)
+		} else if conn.State().IfOneOfState([]State{SYN_RECEIVED, ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, LAST_ACK, TIME_WAIT}) {
+			// STEP 1: check seq num
+			if AcceptableSegSeq(&recSeg, &conn.RCV, conn.IRS) {
+				// trim the from the begenning of the payload
+				trimBegBytes := 0
+				for !ModularLessThanEqual(conn.RCV.NXT, recSeg.SEQ, conn.IRS) {
+					recSeg.SEQ++
+					recSeg.LEN--
+					trimBegBytes++
 				}
-				conn.SND.UNA = recSeg.ACK
-				conn.SND.WND = recSeg.WND
-				conn.SND.WL1 = recSeg.SEQ
-				conn.SND.WL2 = recSeg.ACK
-				conn.SND.LBW = conn.ISS
-				conn.RCV.LBR = conn.IRS
-				conn.state = ESTABLISHED
-				conn.HandshakeDone <- true
-			}
-		} else if AcceptableSegSeq(&recSeg, &conn.RCV, conn.IRS) {
-			// trim the from the begenning of the payload
-			trimBegBytes := 0
-			for !ModularLessThanEqual(conn.RCV.NXT, recSeg.SEQ, conn.IRS) {
-				recSeg.SEQ++
-				recSeg.LEN--
-				trimBegBytes++
-			}
-			if trimBegBytes > 0 {
-				tcpPayload = tcpPayload[trimBegBytes:]
+				if trimBegBytes > 0 {
+					tcpPayload = tcpPayload[trimBegBytes:]
+				}
+
+				// trim the from the end of the payload
+				trimEndBytes := 0
+				if !ModularLessThan(recSeg.SEQ+uint32(recSeg.LEN)-1, conn.RCV.NXT+uint32(conn.RCV.WND), conn.IRS) {
+					recSeg.LEN--
+					trimEndBytes++
+				}
+				if trimEndBytes > 0 {
+					tcpPayload = tcpPayload[:recSeg.LEN]
+				}
 			}
 
-			// trim the from the end of the payload
-			trimEndBytes := 0
-			if !ModularLessThan(recSeg.SEQ+uint32(recSeg.LEN)-1, conn.RCV.NXT+uint32(conn.RCV.WND), conn.IRS) {
-				recSeg.LEN--
-				trimEndBytes++
+			// Add payload to the buffer as seg only has metadata
+			for i := 0; i < len(tcpPayload); i++ {
+				conn.RCV.Buf[BufIdx(recSeg.SEQ+uint32(i))] = tcpPayload[i]
 			}
-			if trimEndBytes > 0 {
-				tcpPayload = tcpPayload[:recSeg.LEN]
-			}
+			// Add to early arrival q and if it is on time then it will
+			conn.RCV.EarlyArrivalQ.Push(&recSeg)
 
-			// CONSIDER: moving SYN_RECIEVED state handling here as suggested in RFC
+			for conn.RCV.EarlyArrivalQ.Len() > 0 && conn.RCV.EarlyArrivalQ[0].SEQ == conn.RCV.NXT {
+				currSeg := conn.RCV.EarlyArrivalQ.Pop()
 
-			// ACK is not set then drop
-			if tcpHdr.Flags&header.TCPFlagAck == 0 {
-				slog.Debug("Incoming packet does not have ACK set")
-				return
-			}
+				// STEP 5: Check ACK bit
+				// ACK is not set then drop
+				if currSeg.Flags&header.TCPFlagAck == 0 {
+					slog.Debug("Incoming packet does not have ACK set")
+					return
+				}
 
-			if conn.State() == ESTABLISHED {
-				if tcpHdr.Flags == header.TCPFlagFin|header.TCPFlagAck {
-					seqStart := conn.SND.NXT
-					seg := SEG{
-						SEQ: seqStart,
-						ACK: tcpHdr.SeqNum + 1,
-						LEN: 1,
-						WND: conn.RCV.WND,
+				if conn.State() == SYN_RECEIVED {
+					// ACK rec when in SYN_RECEIVED
+					if ModularLessThan(conn.SND.UNA, currSeg.ACK, conn.ISS) && ModularLessThanEqual(currSeg.ACK, conn.SND.NXT, conn.ISS) {
+						conn.SND.WND = currSeg.WND
+						conn.SND.WL1 = currSeg.SEQ
+						conn.SND.WL2 = currSeg.ACK
+						conn.SND.LBW = conn.ISS
+						conn.RCV.LBR = conn.IRS
+						conn.state = ESTABLISHED
+						conn.HandshakeDone <- true
 					}
-					_, err := conn.TcpStack.SendTCP(conn, header.TCPFlagAck, seg, []byte{})
-					if err != nil {
-						slog.Warn("Failed to send ack of FIN")
-					} else {
-						conn.SND.RetransQ.Push(&seg)
-						conn.state = CLOSE_WAIT
-					}
+				}
 
-				} else {
-					wndUpdated := false
-					if ModularLessThan(conn.SND.UNA, recSeg.ACK, conn.ISS) && ModularLessThanEqual(recSeg.ACK, conn.SND.NXT, conn.ISS) {
-						for conn.SND.RetransQ.Len() > 0 && ModularLessThanEqual(conn.SND.RetransQ[0].SEQ+uint32(conn.SND.RetransQ[0].LEN), recSeg.ACK, conn.ISS) {
+				finAck := false
+				if conn.State().IfOneOfState([]State{ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, CLOSING}) {
+					// wndUpdated := false
+					if ModularLessThan(conn.SND.UNA, currSeg.ACK, conn.ISS) && ModularLessThanEqual(currSeg.ACK, conn.SND.NXT, conn.ISS) { // Valid ACK
+						for conn.SND.RetransQ.Len() > 0 && ModularLessThanEqual(conn.SND.RetransQ[0].SEQ+uint32(conn.SND.RetransQ[0].LEN), currSeg.ACK, conn.ISS) {
 							ackedSeg := conn.SND.RetransQ.Pop()
-							conn.SND.UNA = ackedSeg.ACK
-							if (ModularLessThan(conn.SND.WL1, ackedSeg.SEQ, conn.ISS)) || (conn.SND.WL1 == ackedSeg.SEQ && ModularLessThanEqual(conn.SND.WL2, ackedSeg.ACK, conn.ISS)) {
-								conn.SND.WND = ackedSeg.WND
-								conn.SND.WL1 = ackedSeg.SEQ
-								conn.SND.WL2 = ackedSeg.ACK
-								wndUpdated = true
+							if ackedSeg.Flags&header.TCPFlagFin > 0 { // FIN got acked
+								finAck = true
 							}
 						}
-					} else if conn.SND.UNA == recSeg.ACK {
-						// nothing to be acked but potentially update wnd
-						if (ModularLessThan(conn.SND.WL1, recSeg.SEQ, conn.ISS)) || (conn.SND.WL1 == recSeg.SEQ && ModularLessThanEqual(conn.SND.WL2, recSeg.ACK, conn.ISS)) {
-							conn.SND.WND = recSeg.WND
-							conn.SND.WL1 = recSeg.SEQ
-							conn.SND.WL2 = recSeg.ACK
-							wndUpdated = true
-						}
-					} else if ModularLessThan(conn.SND.NXT, recSeg.ACK, conn.ISS) { // ACK for something not sent, just inform the correct ack num expected
+						conn.SND.UNA = currSeg.ACK
+					} else if ModularLessThan(conn.SND.NXT, currSeg.ACK, conn.ISS) { // ACK for something not sent, just inform the correct ack num expected
 						sendSeg := SEG{
-							SEQ: conn.SND.NXT,
-							ACK: conn.RCV.NXT,
-							LEN: 0,
-							WND: conn.RCV.WND,
+							SEQ:   conn.SND.NXT,
+							ACK:   conn.RCV.NXT,
+							LEN:   0,
+							WND:   conn.RCV.WND,
+							Flags: header.TCPFlagAck,
 						}
-						_, err = tcpStack.SendTCP(conn, header.TCPFlagAck, sendSeg, []byte{})
+						_, err = tcpStack.SendTCP(conn, sendSeg, []byte{})
 						if err != nil {
 							slog.Warn("Failed to send ACK")
 							return
 						}
-					} else { // Duplicate ACK
+					}
+					// CONSIDER: Duplicate ACK is to be ignored, does this mean to drop packet and return
+
+					if ModularLessThanEqual(conn.SND.UNA, currSeg.ACK, conn.ISS) && ModularLessThanEqual(currSeg.ACK, conn.SND.NXT, conn.ISS) {
+						if (ModularLessThan(conn.SND.WL1, currSeg.SEQ, conn.ISS)) || (conn.SND.WL1 == currSeg.SEQ && ModularLessThanEqual(conn.SND.WL2, currSeg.ACK, conn.ISS)) {
+							conn.SND.WND = currSeg.WND
+							conn.SND.WL1 = currSeg.SEQ
+							conn.SND.WL2 = currSeg.ACK
+							conn.SND.SpaceAvailableCond.Signal()
+						}
+					}
+
+				}
+
+				if conn.State() == FIN_WAIT_1 {
+					if finAck {
+						conn.state = FIN_WAIT_2
+					}
+				}
+
+				if conn.State() == FIN_WAIT_2 {
+					if conn.SND.RetransQ.Len() == 0 {
+						fmt.Println("CLOSE: ok")
+					}
+				}
+
+				if conn.State() == CLOSING {
+					if finAck {
+						conn.state = TIME_WAIT
+					}
+				}
+
+				if conn.State() == LAST_ACK {
+					if conn.SND.RetransQ.Len() > 0 && ModularLessThanEqual(conn.SND.RetransQ[0].SEQ+uint32(conn.SND.RetransQ[0].LEN), currSeg.ACK, conn.ISS) {
+						ackedSeg := conn.SND.RetransQ.Pop()
+						if ackedSeg.Flags&header.TCPFlagFin > 0 { // FIN got acked
+							// TODO: delete TCB
+							delete(conn.TcpStack.SocketTable, conn.sId)
+							delete(conn.TcpStack.EphemeralPortSet, conn.RPort())
+							conn.state = CLOSED
+						}
+						conn.SND.UNA = currSeg.ACK
+					}
+				}
+
+				if conn.State() == TIME_WAIT {
+					if currSeg.Flags&header.TCPFlagFin > 0 {
+						conn.RCV.NXT++
+						sendSeg := SEG{
+							SEQ:   conn.SND.NXT,
+							ACK:   conn.RCV.NXT,
+							LEN:   0,
+							WND:   conn.RCV.WND,
+							Flags: header.TCPFlagAck,
+						}
+						_, err = tcpStack.SendTCP(conn, sendSeg, []byte{})
+						if err != nil {
+							slog.Warn("Failed to send ACK")
+							return
+						}
+						// TODO: restart the 2 MSL timeou
+					}
+
+				}
+
+				// STEP 7: process the segment text
+				if currSeg.LEN > 0 && conn.State().IfOneOfState([]State{ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2}) {
+					conn.RCV.NXT += uint32(currSeg.LEN)
+					conn.RCV.WND -= currSeg.LEN
+					// NXT updated thus data available
+					conn.RCV.DataAvailableCond.Signal()
+					// If text was recvd then ack it
+					sendSeg := SEG{
+						SEQ:   conn.SND.NXT,
+						ACK:   conn.RCV.NXT,
+						LEN:   0,
+						WND:   conn.RCV.WND,
+						Flags: header.TCPFlagAck,
+					}
+					_, err = tcpStack.SendTCP(conn, sendSeg, []byte{})
+					if err != nil {
+						slog.Warn("Failed to send ACK")
+						return
+					}
+				}
+
+				// STEP 8: check the FIN bit
+				if currSeg.Flags&header.TCPFlagFin > 0 {
+					if conn.State() == CLOSED || conn.State() == LISTEN || conn.State() == SYN_SENT {
+						continue
+					}
+					fmt.Println("CLOSE: connection closing")
+					for conn.RCV.EarlyArrivalQ.Len() > 0 {
+						fmt.Println("CLOSE: connection closing")
+						conn.RCV.EarlyArrivalQ.Pop()
+					}
+					conn.RCV.NXT++
+					sendSeg := SEG{
+						SEQ:   conn.SND.NXT,
+						ACK:   conn.RCV.NXT,
+						LEN:   0,
+						WND:   conn.RCV.WND,
+						Flags: header.TCPFlagAck,
+					}
+					_, err = tcpStack.SendTCP(conn, sendSeg, []byte{})
+					if err != nil {
+						slog.Warn("Failed to send ACK")
 						return
 					}
 
-					if wndUpdated {
-						conn.SND.SpaceAvailableCond.Signal()
-					}
-
-					// Process the segment text, handles both on time and early arrivals, duplicates will be ignored after begTrim
-					for i := 0; i < len(tcpPayload); i++ {
-						conn.RCV.Buf[BufIdx(recSeg.SEQ+uint32(i))] = tcpPayload[i]
-					}
-					if recSeg.SEQ == conn.RCV.NXT { // On time arrival
-						conn.RCV.NXT += uint32(recSeg.LEN)
-						conn.RCV.WND -= recSeg.LEN
-						for conn.RCV.EarlyArrivalQ.Len() > 0 && conn.RCV.EarlyArrivalQ[0].SEQ == conn.RCV.NXT {
-							earlySeg := conn.RCV.EarlyArrivalQ.Pop()
-							conn.RCV.NXT += uint32(earlySeg.LEN)
-							conn.RCV.WND -= recSeg.LEN
+					if conn.State().IfOneOfState([]State{SYN_RECEIVED, ESTABLISHED}) {
+						conn.state = CLOSE_WAIT
+					} else if conn.State() == FIN_WAIT_1 {
+						if finAck {
+							// TODO: enter TIME-WAIT, start the time-wait timer, turn off the other timers
+							conn.state = TIME_WAIT
+						} else {
+							conn.state = CLOSING
 						}
-						// NXT updated thus data available
-						conn.RCV.DataAvailableCond.Signal()
-					} else { // Early arrival
-						conn.RCV.EarlyArrivalQ.Push(&recSeg)
-					}
-					// If text was recvd then ack it
-					if len(tcpPayload) > 0 {
-						sendSeg := SEG{
-							SEQ: conn.SND.NXT,
-							ACK: conn.RCV.NXT,
-							LEN: 0,
-							WND: conn.RCV.WND,
-						}
-						_, err = tcpStack.SendTCP(conn, header.TCPFlagAck, sendSeg, []byte{})
-						if err != nil {
-							slog.Warn("Failed to send ACK")
-							return
-						}
-					}
-				}
-			}
-			if conn.State() == FIN_WAIT_1 {
-				if tcpHdr.Flags == header.TCPFlagAck {
-					conn.state = FIN_WAIT_2
-				}
-			}
-			if conn.State() == FIN_WAIT_2 {
-				if tcpHdr.Flags == header.TCPFlagFin|header.TCPFlagAck {
-					seqStart := conn.SND.NXT
-					seg := SEG{
-						SEQ: seqStart,
-						ACK: tcpHdr.SeqNum + 1,
-						LEN: 1,
-						WND: conn.RCV.WND,
-					}
-					_, err := conn.TcpStack.SendTCP(conn, header.TCPFlagAck, seg, []byte{})
-					if err != nil {
-						slog.Warn("Failed to send ack of FIN")
-					} else {
-						conn.SND.RetransQ.Push(&seg)
+					} else if conn.State() == FIN_WAIT_2 {
+						// TODO: enter TIME-WAIT, start the time-wait timer, turn off the other timers
 						conn.state = TIME_WAIT
-						// need to calculate MSL and wait for 2*MSL, the following is just a dummy wait
-						time.Sleep(10 * time.Second) // dummy wait
-						sid := conn.sId
-						tcpStack.CtrlLock.Lock()
-						delete(tcpStack.SocketTable, sid)
-						tcpStack.CtrlLock.Unlock()
+					} else if conn.State() == TIME_WAIT {
+						// TODO: Restart the 2 MSL time-wait timeout
+						conn.state = TIME_WAIT
 					}
 				}
-			}
-			if conn.State() == LAST_ACK {
-				if tcpHdr.Flags == header.TCPFlagAck {
-					conn.state = CLOSED
-					sid := conn.sId
-					tcpStack.CtrlLock.Lock()
-					delete(tcpStack.SocketTable, sid)
-					tcpStack.CtrlLock.Unlock()
-				}
+
 			}
 
 		} else { // Not acceptable seg
 			sendSeg := SEG{
-				SEQ: conn.SND.NXT,
-				ACK: conn.RCV.NXT,
-				LEN: 0,
-				WND: conn.RCV.WND,
+				SEQ:   conn.SND.NXT,
+				ACK:   conn.RCV.NXT,
+				LEN:   0,
+				WND:   conn.RCV.WND,
+				Flags: header.TCPFlagAck,
 			}
-			_, err = tcpStack.SendTCP(conn, header.TCPFlagAck, sendSeg, []byte{})
+			_, err = tcpStack.SendTCP(conn, sendSeg, []byte{})
 			if err != nil {
 				slog.Warn("Failed to send ACK")
 				return
 			}
 		}
-		// else if conn.State() == ESTABLISHED {
-		// 	if tcpHdr.SeqNum == conn.Ack { // expected segment
-		// 		if conn.RCV.WND >= uint16(len(tcpPayload)) { // if the payload is too big it will be dropped
-		// 			signalDataAvailable := false
-		// 			if conn.RCV.LBR+1 == conn.RCV.NXT { // check if there was no data to be read
-		// 				signalDataAvailable = true // in which case now inform there is
-		// 			}
-		// 			for i := 0; i < len(tcpPayload); i++ {
-		// 				conn.RCV.buf[conn.RCV.NXT] = tcpPayload[i]
-		// 				conn.RCV.NXT = Mod(conn.RCV.NXT + 1)
-		// 			}
-		// 			if signalDataAvailable {
-		// 				conn.RCV.DataAvailable <- true
-		// 			}
-		// 			conn.Ack += uint32(len(tcpPayload))
-
-		// 		}
-		// 	}
-		// 	// TODO: early arrivals
-		// 	// else if tcpHdr.SeqNum == conn.Ack { // early arrival segment
-		// 	// }
-		// 	for _, seg := range conn.TransmittedSegs {
-		// 		if seg.ACK <= tcpHdr.AckNum {
-		// 			conn.SND.UNA = Mod(conn.SND.UNA + seg.WND)
-		// 			conn.SND.WND = Mod(conn.SND.WND + seg.WND)
-		// 		}
-		// 	}
-		// }
-
 	}
 
 }
 
 // Sending IP messages to the provided destination
-func (tcpStack *TCPStack) SendTCP(conn *VTCPConn, flags uint8, seg SEG, payload []byte) (int, error) {
+func (tcpStack *TCPStack) SendTCP(conn *VTCPConn, seg SEG, payload []byte) (int, error) {
 	tcpHdr := header.TCPFields{
 		SrcPort:       conn.LPort(),
 		DstPort:       conn.RPort(),
 		SeqNum:        seg.SEQ,
 		AckNum:        seg.ACK,
 		DataOffset:    20,
-		Flags:         flags,
+		Flags:         seg.Flags,
 		WindowSize:    seg.WND,
 		Checksum:      0,
 		UrgentPointer: 0,

@@ -106,7 +106,11 @@ func (tcpStack *TCPStack) PrintSocketTable() {
 
 func (listener *VTCPListener) PassiveOpen() {
 	for {
-		listener.VAccept()
+		_, err := listener.VAccept()
+		if err != nil {
+			slog.Warn("VAccept failed", "Err", err)
+			return
+		}
 	}
 }
 
@@ -188,9 +192,20 @@ func (state State) String() string {
 		return "LAST_ACK"
 	case TIME_WAIT:
 		return "TIME_WAIT"
+	case CLOSING:
+		return "CLOSING"
 	default:
 		return ""
 	}
+}
+
+func (tgtState State) IfOneOfState(states []State) bool {
+	for _, state := range states {
+		if tgtState == state {
+			return true
+		}
+	}
+	return false
 }
 
 func AcceptableSegSeq(seg *SEG, rcv *RCV, IRS uint32) bool {

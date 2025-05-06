@@ -166,19 +166,6 @@ func RunREPLExtended(ipStack *ip.IPStack, tcpStack *tcp.TCPStack) {
 			} else {
 				fmt.Printf("Wrote %d bytes\n", n)
 			}
-		case "cl":
-			if len(words) != 2 {
-				fmt.Println("Usage: cl <socket ID>")
-				fmt.Print("> ")
-				continue
-			}
-			sid, err := strconv.Atoi(words[1])
-			if err != nil {
-				fmt.Println("<socket ID> must be an integer")
-				fmt.Print("> ")
-				continue
-			}
-			tcpStack.VClose(sid)
 		case "r":
 			if len(words) < 3 {
 				fmt.Println("Usage: r <socket ID> <numbytes>")
@@ -217,7 +204,62 @@ func RunREPLExtended(ipStack *ip.IPStack, tcpStack *tcp.TCPStack) {
 			} else {
 				fmt.Printf("Read %d bytes: %s\n", n, string(buf))
 			}
-
+		case "sf":
+			if len(words) < 4 {
+				fmt.Println("Usage: sf <filename> <ip> <port>")
+				fmt.Print("> ")
+				continue
+			}
+			filename := words[1]
+			ip, err := netip.ParseAddr(words[2])
+			if err != nil {
+				fmt.Println("<ip> must be an IP address in dotted quad notation ")
+				fmt.Print("> ")
+				continue
+			}
+			port, err := strconv.Atoi(words[3])
+			if err != nil {
+				fmt.Println("<port> must be a 16-bit unsigned integer")
+				fmt.Print("> ")
+				continue
+			}
+			SendFile(tcpStack, filename, ip, uint16(port))
+		case "rf":
+			if len(words) < 3 {
+				fmt.Println("Usage: rf <filename> <port>")
+				fmt.Print("> ")
+				continue
+			}
+			filename := words[1]
+			port, err := strconv.Atoi(words[2])
+			if err != nil {
+				fmt.Println("<port> must be a 16-bit unsigned integer")
+				fmt.Print("> ")
+				continue
+			}
+			go RecvFile(tcpStack, filename, uint16(port))
+		case "cl":
+			if len(words) < 2 {
+				fmt.Println("Usage: cl <socket ID>")
+				fmt.Print("> ")
+				continue
+			}
+			sid, err := strconv.Atoi(words[1])
+			if err != nil {
+				fmt.Println("<socket ID> must be an integer")
+				fmt.Print("> ")
+				continue
+			}
+			sock, ok := tcpStack.SocketTable[uint16(sid)]
+			if !ok {
+				fmt.Println("socket not found")
+				fmt.Print("> ")
+				continue
+			}
+			err = sock.VClose()
+			if err != nil {
+				fmt.Println("error closing socket: ", err)
+			}
 		default:
 			fmt.Println("Invalid command:")
 			ListCommands(true)
@@ -242,6 +284,11 @@ func ListCommands(extended bool) {
 		fmt.Fprintf(w, "\t%s\t%s\n", "ls", "List sockets")
 		fmt.Fprintf(w, "\t%s\t%s\n", "a", "Listen on a port and accept new connections")
 		fmt.Fprintf(w, "\t%s\t%s\n", "c", "Connect to a TCP socket")
+		fmt.Fprintf(w, "\t%s\t%s\n", "s", "Send on a socket")
+		fmt.Fprintf(w, "\t%s\t%s\n", "r", "Receive on a socket")
+		fmt.Fprintf(w, "\t%s\t%s\n", "sf", "Send a file")
+		fmt.Fprintf(w, "\t%s\t%s\n", "rf", "Receive a file")
+		fmt.Fprintf(w, "\t%s\t%s\n", "cl", "Close socket")
 	}
 	w.Flush()
 }
