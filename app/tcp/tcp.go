@@ -84,17 +84,18 @@ type SEG struct {
 }
 
 type SND struct {
-	Buf                []byte
-	UNA                uint32
-	NXT                uint32
-	WND                uint16
-	LBW                uint32
-	WL1                uint32
-	WL2                uint32
-	BufLock            sync.Mutex
-	SpaceAvailableCond *sync.Cond
-	DataAvailableCond  *sync.Cond
-	RetransQ           SegPriorityQueue
+	Buf                  []byte
+	UNA                  uint32
+	NXT                  uint32
+	WND                  uint16
+	LBW                  uint32
+	WL1                  uint32
+	WL2                  uint32
+	BufLock              sync.Mutex
+	SpaceAvailableCond   *sync.Cond
+	DataAvailableCond    *sync.Cond
+	NoDataToTransmitCond *sync.Cond
+	RetransQ             SegPriorityQueue
 }
 
 type RCV struct {
@@ -186,6 +187,10 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 	}
 
 	if listener != nil {
+
+		listener.SockLock.Lock()
+		defer listener.SockLock.Unlock()
+
 		// SYN rec for listener, create a new conn, send SYN+ACK and send conn to chan NewConns
 		if recSeg.Flags == header.TCPFlagSyn {
 
@@ -230,8 +235,9 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 	}
 
 	if conn != nil {
+
 		conn.SockLock.Lock()
-		conn.RCV.BufLock.Lock()
+		conn.RCV.BufLock.Lock() //
 		conn.SND.BufLock.Lock()
 		defer conn.SND.BufLock.Unlock()
 		defer conn.RCV.BufLock.Unlock()
@@ -476,7 +482,7 @@ func (tcpStack *TCPStack) TCPPacketHandler(ipStack *ip.IPStack, data []byte) {
 					conn.RCV.NXT++
 					sendSeg := SEG{
 						SEQ:   conn.SND.NXT,
-						ACK:   conn.RCV.NXT,
+						ACK:   conn.RCV.NXT + 0, // This is the last seq num expected as this is FIN
 						LEN:   0,
 						WND:   conn.RCV.WND,
 						Flags: header.TCPFlagAck,

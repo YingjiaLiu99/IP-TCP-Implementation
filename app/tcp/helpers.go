@@ -47,6 +47,7 @@ func NewVTCPConn(tcpStack *TCPStack) *VTCPConn {
 	}
 	conn.SND.SpaceAvailableCond = sync.NewCond(&conn.SND.BufLock)
 	conn.SND.DataAvailableCond = sync.NewCond(&conn.SND.BufLock)
+	conn.SND.NoDataToTransmitCond = sync.NewCond(&conn.SND.BufLock)
 	conn.RCV.DataAvailableCond = sync.NewCond(&conn.RCV.BufLock)
 	return conn
 }

@@ -70,11 +70,13 @@ func (listener *VTCPListener) VAccept() (*VTCPConn, error) {
 // Any pending requests to create new connections should be deleted.
 func (listener *VTCPListener) VClose() error {
 	listener.TcpStack.CtrlLock.Lock()
+	listener.SockLock.Lock()
+	defer listener.SockLock.Unlock()
+	defer listener.TcpStack.CtrlLock.Unlock()
 	listener.state = CLOSED
 	delete(listener.TcpStack.SocketTable, listener.sId)
 	delete(listener.TcpStack.EphemeralPortSet, listener.LPort())
 	close(listener.NewConns)
-	defer listener.TcpStack.CtrlLock.Unlock()
 	return nil
 }
 
@@ -141,20 +143,36 @@ func (tcpStack *TCPStack) VConnect(addr netip.Addr, port uint16) (*VTCPConn, err
 func (conn *VTCPConn) VRead(buf []byte) (int, error) {
 	conn.SockLock.Lock()
 	if conn.State() != ESTABLISHED && conn.State() != CLOSE_WAIT {
+		conn.SockLock.Unlock()
 		return 0, io.EOF
 	}
 	conn.SockLock.Unlock()
+
 	conn.RCV.BufLock.Lock()
 	for !ModularLessThan(conn.RCV.LBR+1, conn.RCV.NXT, conn.IRS) { // check if no data available to be read
+		// Check if nothing to be read and in CLOSE_WAIT, i.e. other side done sending
+		conn.SockLock.Lock()
+		if conn.State() == CLOSE_WAIT {
+			conn.SockLock.Unlock()
+			conn.RCV.BufLock.Unlock()
+			return 0, io.EOF
+		}
+		conn.SockLock.Unlock()
+
 		conn.RCV.DataAvailableCond.Wait() // unblock only when data available to be read
 	}
+	conn.SockLock.Lock()
 	bytesRead := 0
 	for ModularLessThan(conn.RCV.LBR+1, conn.RCV.NXT, conn.IRS) && bytesRead < len(buf) {
 		conn.RCV.LBR++
 		conn.RCV.WND++
-		buf[bytesRead] = conn.RCV.Buf[BufIdx(conn.RCV.LBR)]
-		bytesRead++
+		// not the last byte of stream which is FIN then read into user buffer
+		if conn.State() != CLOSE_WAIT || conn.RCV.LBR != conn.RCV.NXT-1 {
+			buf[bytesRead] = conn.RCV.Buf[BufIdx(conn.RCV.LBR)]
+			bytesRead++
+		}
 	}
+	conn.SockLock.Unlock()
 	conn.RCV.BufLock.Unlock()
 	return bytesRead, nil
 }
@@ -165,13 +183,14 @@ func (conn *VTCPConn) TransmitData() {
 	for {
 		conn.SND.BufLock.Lock()
 		for !ModularLessThanEqual(conn.SND.NXT, conn.SND.LBW, conn.ISS) { // check if no data available to be sent
+			conn.SND.NoDataToTransmitCond.Signal()
 			conn.SND.DataAvailableCond.Wait() // unblock only when data available to be sent
 		}
 
 		var payloadSize uint16 = 0
 		seqStart := conn.SND.NXT
 		payload := []byte{}
-		for ModularLessThanEqual(conn.SND.NXT, conn.SND.LBW, conn.ISS) && payloadSize <= MaxSegmentSize {
+		for ModularLessThanEqual(conn.SND.NXT, conn.SND.LBW, conn.ISS) && payloadSize < MaxSegmentSize {
 			payload = append(payload, conn.SND.Buf[BufIdx(conn.SND.NXT)])
 			payloadSize++
 			conn.SND.NXT++
@@ -230,8 +249,13 @@ func (conn *VTCPConn) VWrite(data []byte) (int, error) {
 // Initiates the connection termination process for this socket (equivalent to CLOSE in the RFC).
 // This method should be used to indicate that the user is done sending/receiving on this socket.
 func (conn *VTCPConn) VClose() error {
+
+	conn.SND.BufLock.Lock()
+	for ModularLessThanEqual(conn.SND.NXT, conn.SND.LBW, conn.ISS) { // check if data available to be sent
+		conn.SND.NoDataToTransmitCond.Wait() // unblock only when no data available to be sent
+	}
+
 	conn.SockLock.Lock()
-	defer conn.SockLock.Unlock()
 	seg := SEG{
 		SEQ:   conn.SND.NXT,
 		ACK:   conn.RCV.NXT,
@@ -242,6 +266,8 @@ func (conn *VTCPConn) VClose() error {
 	_, err := conn.TcpStack.SendTCP(conn, seg, []byte{})
 	if err != nil {
 		slog.Warn("Failed to send FIN|ACK")
+		conn.SockLock.Unlock()
+		conn.SND.BufLock.Unlock()
 		return err
 	}
 	conn.SND.NXT++
@@ -251,5 +277,7 @@ func (conn *VTCPConn) VClose() error {
 	} else if conn.state == CLOSE_WAIT {
 		conn.state = LAST_ACK
 	}
+	conn.SockLock.Unlock()
+	conn.SND.BufLock.Unlock()
 	return nil
 }
